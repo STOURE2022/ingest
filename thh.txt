@@ -291,6 +291,7 @@ def register_table_in_metastore(spark, table_name: str, path: str,
 
 D. Patches dans src/ingestion.py (écriture UC)
 
+
 On route selon le flag use_unity_catalog :
 
 from uc_manager import uc_enabled, full_table_name, create_schema_if_needed
