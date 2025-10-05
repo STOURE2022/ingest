@@ -1,0 +1,62 @@
+# Configuration du Job Databricks pour WAX Pipeline
+resources:
+  jobs:
+    wax_etl_pipeline:
+      name: WAX ETL Pipeline - ${bundle.target}
+
+      job_clusters:
+        - job_cluster_key: wax_cluster
+          new_cluster:
+            spark_version: 13.3.x-scala2.12
+            node_type_id: i3.xlarge
+            num_workers: 2
+            spark_conf:
+              spark.databricks.delta.preview.enabled: "true"
+              spark.databricks.delta.retentionDurationCheck.enabled: "false"
+            custom_tags:
+              project: wax_pipeline
+              environment: ${bundle.target}
+
+      tasks:
+        - task_key: wax_ingestion
+          job_cluster_key: wax_cluster
+
+          notebook_task:
+            notebook_path: ../notebooks/wax_pipeline_main
+            base_parameters:
+              env: ${bundle.target}
+              version: v1
+              zip_path: dbfs:/FileStore/tables/waxsite_20250909_120001.zip
+              excel_path: dbfs:/FileStore/tables/waxsite_20250909_120001.xlsx
+              extract_dir: dbfs:/tmp/unzipped_wax_csvs
+              log_exec_path: /mnt/logs/wax_execution_logs_delta
+              log_quality_path: /mnt/logs/wax_data_quality_errors
+              log_error_path: /mnt/logs/wax_specific_errors
+
+          libraries:
+            - whl: ../dist/wax_pipeline-1.0.0-py3-none-any.whl
+
+          timeout_seconds: 3600
+          max_retries: 2
+          min_retry_interval_millis: 60000
+          retry_on_timeout: true
+
+      schedule:
+        quartz_cron_expression: "0 0 2 * * ?"  # Tous les jours à 2h du matin
+        timezone_id: "Europe/Paris"
+        pause_status: UNPAUSED
+
+      email_notifications:
+        on_failure:
+          - data-engineering@company.com
+        on_success:
+          - data-engineering@company.com
+        no_alert_for_skipped_runs: false
+
+      max_concurrent_runs: 1
+      timeout_seconds: 7200
+
+      tags:
+        project: wax
+        team: data_engineering
+        environment: ${bundle.target}

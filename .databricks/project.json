@@ -1,0 +1,4 @@
+{
+  "profile": "DEFAULT",
+  "artifact_path": "/Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}/files"
+}

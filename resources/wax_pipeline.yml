@@ -1,0 +1,27 @@
+# Configuration du Pipeline WAX
+resources:
+  pipelines:
+    wax_delta_live_tables:
+      name: WAX Delta Live Tables - ${bundle.target}
+
+      target: wax_${bundle.target}
+
+      libraries:
+        - notebook:
+            path: ../notebooks/wax_dlt_pipeline
+
+      clusters:
+        - label: default
+          num_workers: 2
+          node_type_id: i3.xlarge
+          spark_conf:
+            spark.databricks.delta.preview.enabled: "true"
+
+      development: true
+      continuous: false
+
+      configuration:
+        env: ${bundle.target}
+        version: v1
+
+      channel: CURRENT

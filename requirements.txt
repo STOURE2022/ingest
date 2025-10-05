@@ -1,0 +1,21 @@
+# WAX Pipeline - Requirements
+# Dépendances pour le build et l'exécution
+
+# Core dependencies
+pyspark>=3.3.0
+pandas>=1.5.0
+numpy>=1.23.0
+openpyxl>=3.0.0
+
+# Delta Lake (optionnel pour local, obligatoire sur Databricks)
+# delta-spark>=2.0.0
+
+# Date handling
+python-dateutil>=2.8.0
+
+# Testing dependencies
+pytest>=7.0.0
+pytest-cov>=3.0.0
+pytest-mock>=3.10.0
+setuptools~=65.5.1
+py4j~=0.10.9.9
