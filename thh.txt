@@ -1,0 +1,393 @@
+top — voilà comment brancher Auto Loader proprement sur ton pipeline sans casser ta logique actuelle, et comment basculer vers Unity Catalog (tables managées) quand tu es sur Databricks.
+
+Je te donne des ajouts modulaires prêts à coller dans src/ + les quelques patchs à faire dans les fichiers existants.
+
+1) Auto Loader (ingestion incrémentale fichiers)
+🧠 Principe
+
+On lance 1 stream par table (recommandé) : chaque table a son répertoire d’arrivée (landing_dir/<table>), son séparateur, son header, etc.
+
+On lit avec Auto Loader (format("cloudFiles")) → readStream.
+
+On applique ta transformation + data quality dans un foreachBatch (micro-batch = DataFrame classique).
+
+On réutilise exactement tes fonctions (typage, ICT_DRIVEN/REJECT/LOG_ONLY, ingestion modes…) ✅
+
+✅ Ce qu’on ajoute
+A. src/streaming_autoloader.py (nouveau)
+# src/streaming_autoloader.py
+from typing import List, Tuple
+import os
+import re
+import pandas as pd
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+
+from file_processor import apply_column_transformations
+from validators import check_data_quality, print_summary, spark_type_from_config
+from logging_manager import write_quality_errors, log_execution
+from ingestion import apply_ingestion_mode
+from utils import parse_bool, parse_header_mode, normalize_delimiter, ensure_dbfs_local
+
+def _table_landing_dir(params: dict, table_name: str) -> str:
+    base = params.get("landing_base_dir")
+    if not base:
+        # fallback DBFS
+        base = "/mnt/landing" if params.get("env") != "local" else os.path.join(os.path.dirname(__file__), "..", "data", "landing")
+    return f"{base.rstrip('/')}/{table_name}"
+
+def _schema_location(params: dict, table_name: str) -> str:
+    base = params.get("schema_location", "/mnt/schemas/wax")
+    return f"{base.rstrip('/')}/{table_name}"
+
+def _checkpoint_location(params: dict, table_name: str) -> str:
+    base = params.get("checkpoint_base", "/mnt/checkpoints/wax")
+    return f"{base.rstrip('/')}/{table_name}"
+
+def _expected_schema(column_defs: pd.DataFrame, table_name: str):
+    from pyspark.sql.types import StructType, StructField
+    subset = column_defs[column_defs.get("Delta Table Name", column_defs.get("Data Table Name")).eq(table_name)]
+    if subset.empty:
+        return None, []
+    if "Field Order" in subset.columns:
+        subset = subset.sort_values(by=["Field Order"])
+    fields = [StructField(str(r["Column Name"]).strip(), spark_type_from_config(r), True) for _, r in subset.iterrows()]
+    return StructType(fields), [f.name for f in fields], subset
+
+def _per_table_stream(spark: SparkSession, params: dict, table_row: pd.Series,
+                      column_defs: pd.DataFrame):
+    """
+    Démarre 1 Auto Loader stream pour la table donnée. Retourne le StreamingQuery.
+    """
+    table_name = str(table_row.get("Delta Table Name", table_row.get("Data Table Name",""))).strip()
+    landing_dir = _table_landing_dir(params, table_name)
+    schema_loc  = _schema_location(params, table_name)
+    ckpt_loc    = _checkpoint_location(params, table_name)
+
+    use_header, first_line_only = parse_header_mode(table_row.get("Input header", table_row.get("Input Header","HEADER USE")))
+    sep_char    = normalize_delimiter(table_row.get("Input delimiter", ",")) or ","
+    charset     = str(table_row.get("Input charset","UTF-8") or "UTF-8").strip()
+    ignore_empty= parse_bool(table_row.get("Ignore Empty Files", True), True)
+    ingestion_mode = str(table_row.get("Ingestion mode","")).strip()
+    output_zone = str(table_row.get("Output Zone", table_row.get("Input Zone","internal"))).strip().lower()
+
+    imposed_schema, expected_cols, subset = _expected_schema(column_defs, table_name)
+
+    # ⚠️ Auto Loader lit un répertoire (abfss:/, s3:/, dbfs:/mnt/...), pas un zip.
+    # Tu déposes tes nouveaux fichiers dans landing_dir/table_name/*
+    reader = (spark.readStream
+              .format("cloudFiles")
+              .option("cloudFiles.format", "csv")
+              .option("header", str(use_header and not first_line_only).lower())
+              .option("sep", sep_char)
+              .option("encoding", charset)
+              .option("ignoreEmptyFiles", str(ignore_empty).lower())
+              .option("cloudFiles.schemaLocation", schema_loc)
+              .option("cloudFiles.inferColumnTypes", "true")
+              .option("cloudFiles.schemaEvolutionMode", "addNewColumns")
+              .option("rescuedDataColumn", "_rescued_data")
+              .option("cloudFiles.includeExistingFiles", "true")   # ingère aussi l'historique au démarrage
+              )
+
+    # Schéma imposé si fourni (plus stable que l’inférence)
+    if imposed_schema is not None:
+        df_stream = reader.schema(imposed_schema).load(landing_dir)
+    else:
+        df_stream = reader.load(landing_dir)
+
+    # On garde le chemin source (utile pour logs)
+    df_stream = df_stream.withColumn("source_file", F.input_file_name())
+
+    # --- foreachBatch: applique exactement ta logique sur chaque micro-batch ---
+    def _process_batch(batch_df: DataFrame, batch_id: int):
+        # On bascule en DataFrame classique.
+        file_list = [r["source_file"] for r in batch_df.select("source_file").distinct().collect()]
+        if not file_list:
+            return
+
+        # FIRST_LINE : on supprime la 1ère ligne dans le batch
+        if use_header and first_line_only:
+            from pyspark.sql.window import Window
+            batch_df = batch_df.withColumn("_rn", F.row_number().over(Window.orderBy(F.monotonically_increasing_id()))) \
+                               .filter(F.col("_rn") > 1).drop("_rn")
+
+        # Trim global
+        for c in batch_df.columns:
+            if c != "source_file":
+                batch_df = batch_df.withColumn(c, F.trim(F.col(c)))
+
+        filename = os.path.basename(file_list[0])
+
+        # Transformations + DQ par colonne (ta logique)
+        transformed = apply_column_transformations(batch_df, subset, table_name=table_name,
+                                                   filename=filename, zone=output_zone, spark=spark)
+
+        if transformed.limit(1).count() == 0:
+            # ICT_DRIVEN_ABORT
+            log_execution(spark, params, table_name, filename, ingestion_mode,
+                          len(batch_df.columns), 0, False, 0, "ICT_DRIVEN_ABORT", "FAILED")
+            return
+
+        # DQ globale
+        merge_keys = []
+        if "isMergeKey" in subset.columns:
+            merge_keys = subset[subset["isMergeKey"].astype(str).str.lower().isin(["1","true"])]["Column Name"].tolist()
+
+        df_err_global = check_data_quality(df=transformed, table_name=table_name, merge_keys=merge_keys,
+                                           column_defs=subset, filename=filename, spark=spark)
+        if df_err_global is not None and not df_err_global.rdd.isEmpty():
+            write_quality_errors(spark, df_err_global, table_name=table_name, filename=filename,
+                                 zone=output_zone, env=params.get("env","local"), base_path=params.get("log_quality_path"))
+
+        # Ingestion (all/last) via tes modes
+        apply_ingestion_mode(spark=spark, df_raw=transformed, column_defs=subset, table_name=table_name,
+                             ingestion_mode=ingestion_mode, params=params, zone=output_zone,
+                             version=params.get("version","v1"), parts={}, file_name_received=filename)
+
+        # Logs exécution
+        anomalies_total = 0 if df_err_global is None else df_err_global.count()
+        print_summary(table_name, filename, 0, anomalies_total, transformed.count(), df_err_global)
+        log_execution(spark, params, table_name, filename, ingestion_mode,
+                      len(transformed.columns), anomalies_total, False, anomalies_total, str(anomalies_total), "SUCCESS")
+
+    query = (df_stream.writeStream
+             .trigger(availableNow=False)  # change en "processingTime" si tu veux un polling (ex: "30 seconds")
+             .option("checkpointLocation", ckpt_loc)
+             .foreachBatch(_process_batch)
+             .start())
+    print(f"⚙️ Auto Loader lancé pour {table_name} | landing={landing_dir}")
+    return query
+
+def start_all_streams(spark: SparkSession, params: dict,
+                      columns_df: pd.DataFrame, tables_df: pd.DataFrame):
+    """Démarre un flux Auto Loader par table (recommandé)."""
+    queries = []
+    for _, trow in tables_df.iterrows():
+        queries.append(_per_table_stream(spark, params, trow, columns_df))
+    return queries
+
+B. Patches minimes dans src/config.py
+
+Ajoute des paramètres Auto Loader (chemins par défaut ; adapte si tu as déjà des mounts) :
+
+# dans get_databricks_config(...)
+params["landing_base_dir"] = "/mnt/landing/wax"
+params["schema_location"]  = "/mnt/schemas/wax"
+params["checkpoint_base"]  = "/mnt/checkpoints/wax"
+
+
+(et la même chose avec des chemins locaux dans get_local_config() si tu veux tester en local)
+
+C. Un main streaming (optionnel) : src/main_streaming.py
+# src/main_streaming.py
+from pyspark.sql import SparkSession
+from config import get_config, print_config
+from file_processor import load_excel_config  # on réutilise
+from streaming_autoloader import start_all_streams
+
+def init_spark():
+    spark = SparkSession.getActiveSession() or (
+        SparkSession.builder.appName("WAX_AutoLoader").getOrCreate()
+    )
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
+
+def main():
+    spark = init_spark()
+    try:
+        params = get_config(dbutils)  # Databricks
+    except NameError:
+        params = get_config()         # local fallback
+    print_config(params)
+
+    # Charge la conf Excel (Field-Column / File-Table)
+    cols_df, tables_df = load_excel_config(params["excel_path"], mode=("databricks" if params.get("env")!="local" else "local"))
+
+    # Démarre 1 query par table
+    queries = start_all_streams(spark, params, cols_df, tables_df)
+    print(f"🚀 {len(queries)} stream(s) Auto Loader en cours. Utilise 'query.awaitTermination()' si besoin.")
+
+if __name__ == "__main__":
+    main()
+
+
+Déploiement
+
+Crée tes répertoires d’arrivée : landing_base_dir/<Delta Table Name>/
+
+Dépose tes CSV dedans.
+
+Démarre main_streaming.py.
+
+Auto Loader surveillera en continu et appliquera la même DQ et ingestion que ton batch.
+
+2) Unity Catalog (tables managées, pas de LOCATION)
+🧠 Principe
+
+En Databricks, si tu veux des tables managées UC, on n’écrit plus par chemin (/mnt/...), on écrit par nom logique catalog.schema.table (UC gère le stockage).
+
+On remplace les appels save_delta(... path ...) par df.write.saveAsTable("cat.schema.table").
+
+Les tables _all et _last existent comme UC tables.
+
+On garde les mêmes modes d’ingestion.
+
+✅ Ce qu’on ajoute
+A. Ajoute un petit helper UC : src/uc_manager.py
+# src/uc_manager.py
+from pyspark.sql import SparkSession, DataFrame
+
+def uc_enabled(spark: SparkSession) -> bool:
+    try:
+        return str(spark.conf.get("spark.databricks.unityCatalog.enabled","false")).lower() == "true"
+    except Exception:
+        return False
+
+def full_table_name(params: dict, base_name: str) -> str:
+    catalog = params.get("uc_catalog")
+    schema  = params.get("uc_schema")
+    if not catalog or not schema:
+        raise ValueError("uc_catalog / uc_schema manquants dans params")
+    return f"{catalog}.{schema}.{base_name}"
+
+def create_schema_if_needed(spark: SparkSession, params: dict):
+    catalog = params.get("uc_catalog")
+    schema  = params.get("uc_schema")
+    if not catalog or not schema:
+        raise ValueError("uc_catalog / uc_schema manquants dans params")
+    spark.sql(f"CREATE CATALOG IF NOT EXISTS {catalog}")
+    spark.sql(f"CREATE SCHEMA  IF NOT EXISTS {catalog}.{schema}")
+
+B. Patches légers src/config.py
+
+Ajoute des flags UC (tu pourras les mettre via widgets plus tard) :
+
+# get_databricks_config(...)
+params["use_unity_catalog"] = True              # ← active UC quand tu veux
+params["uc_catalog"] = "main"                   # adapte
+params["uc_schema"]  = "wax_obs"                # adapte
+
+
+Quand use_unity_catalog=True, on n’utilise plus LOCATION / chemins, on passe par saveAsTable.
+
+C. Patches dans src/delta_manager.py (support UC)
+# AJOUT EN HAUT
+from uc_manager import uc_enabled, full_table_name, create_schema_if_needed
+
+def save_delta_uc(spark: SparkSession, df: DataFrame, table_fullname: str,
+                  mode: str = "append", partition_cols = ("yyyy","mm","dd")) -> None:
+    (df.write.format("delta")
+       .option("mergeSchema","true")
+       .mode(mode)
+       .partitionBy(*partition_cols)
+       .saveAsTable(table_fullname))
+
+def register_table_in_metastore(spark, table_name: str, path: str,
+                                database: str = "wax_obs", if_exists: str = "ignore"):
+    # --- si UC actif, on ne fait rien ici (saveAsTable s’en occupe) ---
+    if uc_enabled(spark):
+        return
+    # ... (le reste de ta version non-UC inchangé) ...
+
+D. Patches dans src/ingestion.py (écriture UC)
+
+On route selon le flag use_unity_catalog :
+
+from uc_manager import uc_enabled, full_table_name, create_schema_if_needed
+from delta_manager import save_delta, save_delta_uc, register_table_in_metastore
+
+def apply_ingestion_mode(...):
+    use_uc = params.get("use_unity_catalog", False) and uc_enabled(spark)
+    if use_uc:
+        create_schema_if_needed(spark, params)
+
+    # noms tables
+    t_all  = f"{table_name}_all"
+    t_last = f"{table_name}_last"
+
+    if use_uc:
+        full_all  = full_table_name(params, t_all)
+        full_last = full_table_name(params, t_last)
+
+        # _all
+        df_all = (df_raw.withColumn("FILE_PROCESS_DATE", current_timestamp()))
+        save_delta_uc(spark, df_all, full_all, mode="append")
+
+        if imode == "FULL_SNAPSHOT":
+            save_delta_uc(spark, df_raw, full_last, mode="overwrite"); return
+        if imode in {"DELTA_FROM_FLOW","DELTA_FROM_HISTORIZED"}:
+            save_delta_uc(spark, df_raw.withColumn("FILE_PROCESS_DATE", current_timestamp()), full_last, mode="append"); return
+        if imode == "DELTA_FROM_NON_HISTORIZED":
+            # même logique MERGE mais en ciblant table UC
+            from delta.tables import DeltaTable
+            if spark._jsparkSession.catalog().tableExists(full_last):
+                target = DeltaTable.forName(spark, full_last)
+                # set up compare_col, merge_keys comme avant...
+                # merge identique, juste "forName" au lieu de "forPath"
+            else:
+                save_delta_uc(spark, df_raw.withColumn("FILE_PROCESS_DATE", current_timestamp()), full_last, mode="overwrite")
+            return
+        if imode == "FULL_KEY_REPLACE":
+            from delta.tables import DeltaTable
+            if spark._jsparkSession.catalog().tableExists(full_last):
+                target = DeltaTable.forName(spark, full_last)
+                keys_df = df_raw.select(*merge_keys).dropDuplicates()
+                (target.alias("t").merge(keys_df.alias("u"),
+                    " AND ".join([f"t.{k}=u.{k}" for k in merge_keys]))
+                 .whenMatchedDelete().execute())
+            save_delta_uc(spark, df_raw.withColumn("FILE_PROCESS_DATE", current_timestamp()), full_last, mode="append"); return
+
+        # Fallback
+        save_delta_uc(spark, df_raw.withColumn("FILE_PROCESS_DATE", current_timestamp()), full_last, mode="append"); return
+
+    # --- sinon (non-UC), on garde ton code existant chemin/LOCATION ---
+    # (ta version précédente, inchangée)
+
+
+Astuce : pour savoir si la table UC existe (dans le mode UC), j’ai utilisé spark._jsparkSession.catalog().tableExists(full_name). Tu peux aussi faire un DESCRIBE TABLE try/except.
+
+3) Bonnes pratiques & check-list
+
+Auto Loader + ADLS (Databricks)
+
+Monte ton stockage (ABFSS) en /mnt/landing (ou utilise directement abfss://...).
+
+Event Grid + notifications (optionnel mais recommandé) → .option("cloudFiles.useNotifications","true").
+
+Une query par table = options propres (delimiter, header…).
+
+schemaLocation et checkpointLocation isolés par table.
+
+Unity Catalog
+
+Crée/choisis ton CATALOG + SCHEMA.
+
+Donne les GRANT nécessaires aux groupes (on ne met pas les GRANTs dans le code pour l’instant).
+
+Avec UC, pas de LOCATION → on travaille uniquement avec saveAsTable.
+
+Compatibilité logique
+
+ICT_DRIVEN, REJECT, LOG_ONLY sont inchangés (executés dans foreachBatch).
+
+Les logs et la DQ restent en Delta path-based (tu peux aussi les migrer en UC plus tard).
+
+🧪 Lancement (Databricks)
+
+Batch (zip) :
+
+python -m src.main (comme avant, lit ton zip et ton Excel).
+
+Streaming (Auto Loader) :
+
+Dépose tes fichiers dans /mnt/landing/wax/<Delta Table Name>/
+
+python -m src.main_streaming
+
+Unity Catalog :
+
+Mets params["use_unity_catalog"]=True + uc_catalog/uc_schema
+
+Lance batch ou streaming → les tables _all et _last seront créées et alimentées en UC managées.
+
+Si tu veux, je peux te renvoyer une branche autoloader_uc avec ces nouveaux fichiers + les patches appliqués sur tes modules actuels.
