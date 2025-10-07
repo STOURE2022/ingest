@@ -1,0 +1,69 @@
+"""
+Module config.py
+----------------
+Gestion de la configuration du pipeline :
+- Détection automatique de l'environnement (local / Databricks)
+- Chargement des chemins de base (ZIP, Excel, logs, etc.)
+- Lecture via widgets Databricks si disponibles
+"""
+
+import os
+
+
+# =========================================================
+# 🔧 Détection environnement
+# =========================================================
+def is_databricks():
+    """
+    Retourne True si le code tourne sur un cluster Databricks.
+    """
+    return "DATABRICKS_RUNTIME_VERSION" in os.environ
+
+
+# =========================================================
+# ⚙️ Lecture configuration globale
+# =========================================================
+def get_config():
+    """
+    Retourne la configuration selon l’environnement.
+    Si Databricks : lit les widgets s’ils existent.
+    Sinon : utilise les chemins locaux.
+    """
+    if is_databricks():
+        print("⚙️ Configuration Databricks détectée ✅")
+        try:
+            dbutils.widgets.text("zip_path", "dbfs:/FileStore/tables/wax_delta_from_historized.zip", "📦 ZIP Source")
+            dbutils.widgets.text("excel_path", "dbfs:/FileStore/tables/custom_test2_secret_conf.xlsx", "📑 Excel Config")
+            dbutils.widgets.text("extract_dir", "dbfs:/tmp/unzipped_wax_csvs", "📂 Dossier Extraction ZIP")
+            dbutils.widgets.text("log_exec_path", "dbfs:/mnt/logs/exec", "📝 Log Exécution (Delta)")
+            dbutils.widgets.text("log_quality_path", "dbfs:/mnt/logs/quality", "🧾 Log Qualité (Delta)")
+
+            config = {
+                "zip_path": dbutils.widgets.get("zip_path"),
+                "excel_path": dbutils.widgets.get("excel_path"),
+                "extract_dir": dbutils.widgets.get("extract_dir"),
+                "log_exec_path": dbutils.widgets.get("log_exec_path"),
+                "log_quality_path": dbutils.widgets.get("log_quality_path"),
+            }
+        except Exception:
+            # Fallback si les widgets ne sont pas dispo
+            config = {
+                "zip_path": "dbfs:/FileStore/tables/wax_delta_from_historized.zip",
+                "excel_path": "dbfs:/FileStore/tables/custom_test2_secret_conf.xlsx",
+                "extract_dir": "dbfs:/tmp/unzipped_wax_csvs",
+                "log_exec_path": "dbfs:/mnt/logs/exec",
+                "log_quality_path": "dbfs:/mnt/logs/quality",
+            }
+
+    else:
+        print("⚙️ Configuration locale chargée ✅")
+        base_path = os.path.dirname(__file__)
+        config = {
+            "zip_path": os.path.join(base_path, "../data/input/wax_delta_from_historized.zip"),
+            "excel_path": os.path.join(base_path, "../data/input/custom_test2_secret_conf.xlsx"),
+            "extract_dir": os.path.join(base_path, "../data/tmp/unzipped_wax_csvs"),
+            "log_exec_path": "./logs/exec",
+            "log_quality_path": "./logs/quality",
+        }
+
+    return config
