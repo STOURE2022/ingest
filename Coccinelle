@@ -1,0 +1,102 @@
+"""
+Configuration Management - VERSION CORRIGÉE
+Remplacez votre fichier src/config.py par celui-ci
+"""
+
+import os
+from typing import Dict, Any
+
+
+def get_local_config() -> Dict[str, Any]:
+    """Configuration pour mode local - CHEMINS CORRIGÉS"""
+    
+    # 🔧 CORRECTION: Utiliser le chemin absolu où se trouve le script
+    # Détection automatique du dossier de base
+    current_file = os.path.abspath(__file__)  # C:\Users\...\wax_pipeline\src\config.py
+    src_dir = os.path.dirname(current_file)    # C:\Users\...\wax_pipeline\src
+    base = os.path.dirname(src_dir)            # C:\Users\...\wax_pipeline
+    
+    print(f"🔍 Dossier de base détecté: {base}")
+    
+    params = {
+        # ✅ CORRECTION: Chemins absolus corrects
+        "zip_path": os.path.join(base, "data", "input", "site_20251201_120001.zip"),
+        "excel_path": os.path.join(base, "data", "input", "waxsite_config.xlsx"),
+        "extract_dir": os.path.join(base, "data", "temp", "unzipped"),
+        "log_exec_path": os.path.join(base, "data", "output", "logs_execution"),
+        "log_quality_path": os.path.join(base, "data", "output", "logs_quality"),
+        "env": "local",
+        "version": "v1"
+    }
+    
+    # Créer les dossiers si nécessaires
+    for key in ["extract_dir", "log_exec_path", "log_quality_path"]:
+        os.makedirs(params[key], exist_ok=True)
+    
+    # Créer aussi data/input si absent
+    input_dir = os.path.join(base, "data", "input")
+    os.makedirs(input_dir, exist_ok=True)
+    
+    # ✅ VÉRIFICATION: Afficher les chemins
+    print("\n📂 Chemins configurés:")
+    for key, value in params.items():
+        exists = "✅" if os.path.exists(value) else "❌"
+        print(f"  {exists} {key}: {value}")
+    
+    # ⚠️ AVERTISSEMENT si fichiers manquants
+    if not os.path.exists(params["zip_path"]):
+        print(f"\n⚠️  ATTENTION: Fichier ZIP manquant!")
+        print(f"   Placez votre fichier ZIP ici: {params['zip_path']}")
+        print(f"   Ou modifiez le nom dans cette fonction")
+    
+    if not os.path.exists(params["excel_path"]):
+        print(f"\n⚠️  ATTENTION: Fichier Excel manquant!")
+        print(f"   Placez votre fichier Excel ici: {params['excel_path']}")
+        print(f"   Ou modifiez le nom dans cette fonction")
+    
+    return params
+
+
+def get_databricks_config(dbutils) -> Dict[str, Any]:
+    """Configuration pour Databricks"""
+    dbutils.widgets.text("zip_path", "dbfs:/FileStore/tables/site_20251201_120001.zip", "📦 ZIP")
+    dbutils.widgets.text("excel_path", "dbfs:/FileStore/tables/waxsite_config.xlsx", "📑 Excel")
+    dbutils.widgets.text("extract_dir", "dbfs:/tmp/unzipped", "📂 Extract")
+    dbutils.widgets.text("log_exec_path", "/mnt/logs/wax_execution_logs_delta", "📝 Logs Exec")
+    dbutils.widgets.text("log_quality_path", "/mnt/logs/wax_data_quality_errors_delta", "🚦 Logs Quality")
+    dbutils.widgets.text("env", "dev", "🌍 Env")
+    dbutils.widgets.text("version", "v1", "📖 Version")
+    
+    return {k: dbutils.widgets.get(k) for k in [
+        "zip_path", "excel_path", "extract_dir", 
+        "log_exec_path", "log_quality_path", "env", "version"
+    ]}
+
+
+def is_databricks() -> bool:
+    """Détecte si on est sur Databricks"""
+    return 'DATABRICKS_RUNTIME_VERSION' in os.environ
+
+
+def get_config(dbutils=None) -> Dict[str, Any]:
+    """Auto-détection de l'environnement"""
+    if dbutils is not None or is_databricks():
+        print("🌐 Mode DATABRICKS")
+        return get_databricks_config(dbutils)
+    else:
+        print("💻 Mode LOCAL")
+        return get_local_config()
+
+
+def print_config(params: Dict[str, Any]):
+    """Affiche la configuration"""
+    print("\n" + "="*80)
+    print("📥 CONFIGURATION CHARGÉE")
+    print("="*80)
+    for k, v in params.items():
+        # Afficher seulement le nom de fichier si chemin trop long
+        display = v
+        if isinstance(v, str) and len(v) > 60:
+            display = "..." + v[-57:]
+        print(f"  {k:20s}: {display}")
+    print("="*80 + "\n")
