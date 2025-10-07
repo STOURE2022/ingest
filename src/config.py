@@ -61,3 +61,102 @@ def print_config(params: Dict[str, Any]) -> None:
     print("✅ Paramètres chargés :")
     for k, v in params.items():
         print(f" - {k}: {v}")
+
+
+
+
+"""
+Module config.py
+----------------
+Gestion de la configuration du pipeline :
+- via widgets Databricks (si disponibles)
+- via valeurs par défaut ou dict local
+- détection automatique de l’environnement (local vs Databricks)
+"""
+import os
+
+
+# =========================================================
+# 🧠 Détection automatique d’environnement
+# =========================================================
+def is_databricks_env():
+    """Détecte si on est sur Databricks via une variable d’environnement."""
+    return os.environ.get("DATABRICKS_RUNTIME_VERSION") is not None
+
+
+# =========================================================
+# ⚙️ Configuration Databricks (widgets)
+# =========================================================
+def get_databricks_config(dbutils):
+    print("⚙️ Chargement config depuis widgets Databricks")
+    return {
+        "zip_path": dbutils.widgets.get("zip_path"),
+        "excel_path": dbutils.widgets.get("excel_path"),
+        "extract_dir": dbutils.widgets.get("extract_dir"),
+        "log_exec_path": dbutils.widgets.get("log_exec_path"),
+        "log_quality_path": dbutils.widgets.get("log_quality_path"),
+        "env": dbutils.widgets.get("env"),
+        "version": dbutils.widgets.get("version"),
+    }
+
+
+# =========================================================
+# 💻 Configuration locale (VSCode / PyCharm)
+# =========================================================
+def get_local_config():
+    print("⚙️ Chargement config locale (fallback)")
+    base = os.getcwd()
+
+    config = {
+        "zip_path": os.path.join(base, "data", "input", "site_20251201_120001.zip"),
+        "excel_path": os.path.join(base, "data", "input", "waxsite_config.xlsx"),
+        "extract_dir": os.path.join(base, "data", "tmp", "unzipped"),
+        "log_exec_path": os.path.join(base, "data", "logs", "execution"),
+        "log_quality_path": os.path.join(base, "data", "logs", "quality"),
+        "env": "dev",
+        "version": "v1",
+    }
+
+    # 🧩 Création automatique des dossiers si manquants
+    for d in [
+        os.path.dirname(config["zip_path"]),
+        config["extract_dir"],
+        config["log_exec_path"],
+        config["log_quality_path"],
+    ]:
+        if not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+            print(f"📁 Dossier créé : {d}")
+
+    # ⚠️ Vérification des fichiers d’entrée
+    if not os.path.exists(config["zip_path"]):
+        print(f"⚠️ Fichier ZIP introuvable : {config['zip_path']}")
+    if not os.path.exists(config["excel_path"]):
+        print(f"⚠️ Fichier Excel introuvable : {config['excel_path']}")
+
+    return config
+
+
+# =========================================================
+# 🧩 Sélection automatique selon l’environnement
+# =========================================================
+def get_config(dbutils=None):
+    """Retourne la bonne configuration selon l’environnement."""
+    try:
+        if is_databricks_env() and dbutils is not None:
+            return get_databricks_config(dbutils)
+        else:
+            return get_local_config()
+    except Exception as e:
+        print(f"⚠️ Erreur de chargement config : {e}")
+        return get_local_config()
+
+
+# =========================================================
+# 🖨️ Affichage formaté
+# =========================================================
+def print_config(config: dict):
+    print("\n===== CONFIGURATION =====")
+    for k, v in config.items():
+        print(f"{k:20} : {v}")
+    print("=========================\n")
