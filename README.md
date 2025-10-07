@@ -17,3 +17,5 @@ ZIP_PATH=... EXCEL_PATH=... EXTRACT_DIR=... LOG_EXEC_PATH=... LOG_QUALITY_PATH=.
 - Quality logs: `/mnt/logs/wax_data_quality_errors_delta`
 
 
+setx HADOOP_HOME "C:\Users\ZZ7MQ\databricks\wax_ingestion_main\winutils"
+setx PATH "%PATH%;%HADOOP_HOME%\bin"
