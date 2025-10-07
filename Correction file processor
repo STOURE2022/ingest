@@ -1,0 +1,64 @@
+"""
+Module file_processor.py
+------------------------
+Gestion du traitement des fichiers ZIP et CSV :
+- Compatible Databricks et exécution locale
+- Liste des fichiers et extraction des données
+"""
+
+import os
+from pyspark.sql import SparkSession
+
+
+# =========================================================
+# 🔧 Détection environnement
+# =========================================================
+def is_databricks():
+    return "DATABRICKS_RUNTIME_VERSION" in os.environ
+
+
+# =========================================================
+# 📂 Liste les fichiers (compatible local + Databricks)
+# =========================================================
+def list_files(extract_dir: str, spark: SparkSession = None):
+    """
+    Liste les fichiers dans un dossier local ou sur Databricks.
+    - Si Databricks : utilise dbutils.fs.ls()
+    - Si local : utilise os.listdir()
+    """
+    if is_databricks():
+        try:
+            from pyspark.dbutils import DBUtils
+            dbutils = DBUtils(spark)
+            files = [f.path for f in dbutils.fs.ls(extract_dir)]
+            print(f"📂 Fichiers détectés sur DBFS : {len(files)} trouvés")
+            return files
+        except Exception as e:
+            print(f"⚠️ Erreur DBFS ({e}) → fallback local")
+
+    # Mode local
+    if os.path.exists(extract_dir):
+        files = [os.path.join(extract_dir, f) for f in os.listdir(extract_dir)]
+        print(f"📂 Fichiers locaux détectés : {len(files)} trouvés")
+        return files
+    else:
+        print(f"❌ Dossier inexistant : {extract_dir}")
+        return []
+
+
+# =========================================================
+# 🧾 Exemple d'utilisation
+# =========================================================
+def process_files(spark, params):
+    extract_dir = params["extract_dir"]
+
+    # Création du dossier si inexistant
+    if not os.path.exists(extract_dir) and not is_databricks():
+        print(f"📁 Création du dossier : {extract_dir}")
+        os.makedirs(extract_dir, exist_ok=True)
+
+    all_files = list_files(extract_dir, spark)
+    if not all_files:
+        print("⚠️ Aucun fichier trouvé à traiter.")
+    else:
+        print(f"✅ {len(all_files)} fichier(s) prêt(s) à être traité(s).")
