@@ -1,0 +1,137 @@
+"""
+File Processor Module - IMPORTS CORRIGÉS POUR LOCAL
+Traitement complet des fichiers: extraction ZIP, lecture Excel, parsing CSV
+"""
+
+import os
+import zipfile
+import pandas as pd
+from pyspark.sql import SparkSession
+
+# ✅ CORRECTION: Imports relatifs pour exécution locale
+from utils import parse_bool, normalize_delimiter, parse_header_mode, extract_parts_from_filename
+from validators import check_data_quality, print_summary
+from logging_manager import log_execution, write_quality_errors
+from ingestion import apply_ingestion_mode
+
+
+def extract_zip_file(zip_path: str, extract_dir: str):
+    """Extrait le ZIP"""
+    print(f"📦 Extraction ZIP: {zip_path}")
+    print(f"📂 Destination: {extract_dir}")
+    
+    os.makedirs(extract_dir, exist_ok=True)
+    
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        z.extractall(extract_dir)
+    
+    # Lister les fichiers extraits
+    extracted_files = os.listdir(extract_dir)
+    print(f"✅ ZIP extrait: {len(extracted_files)} fichier(s)")
+    for f in extracted_files[:5]:  # Afficher les 5 premiers
+        print(f"   - {f}")
+    if len(extracted_files) > 5:
+        print(f"   ... et {len(extracted_files) - 5} autres")
+
+
+def load_excel_config(excel_path: str):
+    """Charge la config Excel"""
+    print(f"📑 Lecture Excel: {excel_path}")
+    
+    try:
+        columns_df = pd.read_excel(excel_path, sheet_name="Field-Column")
+        tables_df = pd.read_excel(excel_path, sheet_name="File-Table")
+        
+        print(f"✅ Config chargée:")
+        print(f"   - {len(columns_df)} colonnes définies")
+        print(f"   - {len(tables_df)} tables à traiter")
+        
+        return columns_df, tables_df
+    
+    except Exception as e:
+        print(f"❌ Erreur lecture Excel: {e}")
+        raise
+
+
+def process_files(spark: SparkSession, params: dict, mode: str = "local"):
+    """Traite tous les fichiers"""
+    print("\n" + "="*80)
+    print("🚀 TRAITEMENT DES FICHIERS")
+    print("="*80 + "\n")
+    
+    # Vérifier que les fichiers existent
+    if not os.path.exists(params["zip_path"]):
+        raise FileNotFoundError(f"❌ Fichier ZIP introuvable: {params['zip_path']}")
+    
+    if not os.path.exists(params["excel_path"]):
+        raise FileNotFoundError(f"❌ Fichier Excel introuvable: {params['excel_path']}")
+    
+    # Extraire le ZIP
+    try:
+        extract_zip_file(params["zip_path"], params["extract_dir"])
+    except Exception as e:
+        print(f"❌ Erreur extraction ZIP: {e}")
+        raise
+    
+    # Charger la config
+    try:
+        columns_df, tables_df = load_excel_config(params["excel_path"])
+    except Exception as e:
+        print(f"❌ Erreur chargement config: {e}")
+        raise
+    
+    # Traiter chaque table
+    print("\n" + "="*80)
+    print("📋 TRAITEMENT DES TABLES")
+    print("="*80 + "\n")
+    
+    for idx, row in tables_df.iterrows():
+        table_name = str(row.get("Delta Table Name", "")).strip()
+        filename_pattern = str(row.get("Filename Pattern", "")).strip()
+        
+        print(f"\n{'='*70}")
+        print(f"📊 Table {idx + 1}/{len(tables_df)}: {table_name}")
+        print(f"   Pattern: {filename_pattern}")
+        print("="*70)
+        
+        # TODO: Ajouter la logique de traitement complète ici
+        # Pour l'instant, affichage des métadonnées
+        
+        input_format = str(row.get("Input Format", "csv")).strip().lower()
+        ingestion_mode = str(row.get("Ingestion mode", "FULL_SNAPSHOT")).strip()
+        delimiter = str(row.get("Input delimiter", ";")).strip()
+        
+        print(f"   Format: {input_format}")
+        print(f"   Mode ingestion: {ingestion_mode}")
+        print(f"   Délimiteur: {delimiter}")
+        
+        # Compter les colonnes définies pour cette table
+        cols_for_table = columns_df[columns_df["Delta Table Name"] == table_name]
+        print(f"   Colonnes attendues: {len(cols_for_table)}")
+        
+        # Chercher les fichiers correspondants
+        import re
+        pattern = filename_pattern.replace("<YYYY>", r"\\d{4}").replace("<MM>", r"\\d{2}").replace("<DD>", r"\\d{2}")
+        pattern = pattern.replace(".csv", r"\\.csv")
+        
+        matched_files = []
+        for f in os.listdir(params["extract_dir"]):
+            if re.match(pattern, f):
+                matched_files.append(f)
+        
+        if matched_files:
+            print(f"   ✅ {len(matched_files)} fichier(s) trouvé(s):")
+            for mf in matched_files:
+                print(f"      - {mf}")
+        else:
+            print(f"   ⚠️  Aucun fichier trouvé pour le pattern: {filename_pattern}")
+    
+    print("\n" + "="*80)
+    print("✅ TRAITEMENT TERMINÉ")
+    print("="*80)
+
+
+# Pour tester ce module directement
+if __name__ == "__main__":
+    print("Module file_processor.py")
+    print("Utilisez main.py pour exécuter le pipeline complet")
