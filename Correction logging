@@ -1,0 +1,94 @@
+"""
+Module logging_manager.py
+-------------------------
+Gestion des logs d'exécution du pipeline :
+- Conversion automatique du timestamp
+- Sauvegarde dans Delta Lake ou local
+"""
+
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.types import (
+    StructType, StructField, StringType, IntegerType, BooleanType, TimestampType
+)
+from time import time
+
+
+def log_execution(
+    spark: SparkSession,
+    params: dict,
+    table_name: str,
+    filename: str,
+    ingestion_mode: str,
+    row_count: int,
+    column_count: int,
+    masklist_applied: bool,
+    error_count: int,
+    error_message: str,
+    status: str,
+    start_time: float
+):
+    """
+    Écrit un log d'exécution complet dans Delta Lake.
+    Fonction compatible Databricks & exécution locale.
+    """
+
+    log_exec_path = params.get("log_exec_path", "./logs/exec")
+
+    # ========================================================
+    # 🔹 Calcul du timestamp et de la durée
+    # ========================================================
+    end_time = time()
+    duration = round(end_time - start_time, 2)
+
+    # Conversion propre du start_time
+    if isinstance(start_time, (float, int)):
+        start_dt = datetime.fromtimestamp(start_time)
+    elif isinstance(start_time, str):
+        try:
+            start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            start_dt = datetime.now()
+    else:
+        start_dt = datetime.now()
+
+    # ========================================================
+    # 🔹 Schéma du log
+    # ========================================================
+    schema = StructType([
+        StructField("timestamp", TimestampType(), True),
+        StructField("table_name", StringType(), True),
+        StructField("filename", StringType(), True),
+        StructField("ingestion_mode", StringType(), True),
+        StructField("row_count", IntegerType(), True),
+        StructField("column_count", IntegerType(), True),
+        StructField("masklist_applied", BooleanType(), True),
+        StructField("error_count", IntegerType(), True),
+        StructField("error_message", StringType(), True),
+        StructField("status", StringType(), True),
+        StructField("duration_sec", StringType(), True),
+    ])
+
+    log_data = [(
+        start_dt,
+        table_name,
+        filename,
+        ingestion_mode,
+        row_count,
+        column_count,
+        masklist_applied,
+        error_count,
+        error_message,
+        status,
+        str(duration)
+    )]
+
+    # ========================================================
+    # 🔹 Écriture Delta
+    # ========================================================
+    try:
+        df_log = spark.createDataFrame(log_data, schema)
+        df_log.write.format("delta").mode("append").save(log_exec_path)
+        print(f"✅ Log écrit → {log_exec_path} | {status} ({duration}s)")
+    except Exception as e:
+        print(f"❌ Erreur lors de l’écriture du log : {e}")
