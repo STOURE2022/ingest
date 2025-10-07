@@ -1,0 +1,1233 @@
+# ============================================================================
+# WAX PIPELINE - STRUCTURE COMPLÈTE DU PROJET
+# ============================================================================
+# 
+# Voici la structure complète du projet WAX Pipeline industrialisé.
+# Créez cette arborescence sur votre système :
+#
+# wax_pipeline/
+# ├── README.md
+# ├── requirements.txt
+# ├── setup.py
+# ├── .gitignore
+# ├── data/
+# │   ├── input/           # Placez vos fichiers ZIP et Excel ici
+# │   ├── temp/            # Fichiers temporaires
+# │   └── output/          # Résultats et logs
+# ├── src/
+# │   ├── __init__.py
+# │   ├── config.py        # ✅ Corrigé
+# │   ├── utils.py         # ✅ Corrigé
+# │   ├── validators.py    # ✅ Corrigé
+# │   ├── delta_manager.py # ✅ Corrigé
+# │   ├── logging_manager.py # ✅ Corrigé
+# │   ├── ingestion.py     # ✅ Corrigé
+# │   ├── file_processor.py # ✅ Corrigé
+# │   └── main.py          # ✅ Corrigé
+# ├── tests/
+# │   ├── __init__.py
+# │   ├── test_utils.py
+# │   └── test_validators.py
+# └── notebooks/
+#     └── wax_databricks.py  # Pour exécution Databricks
+#
+# ============================================================================
+
+# ============================================================================
+# FICHIER 1: README.md
+# ============================================================================
+"""
+# WAX Pipeline - Data Ingestion Framework
+
+Pipeline ETL industriel pour l'ingestion de données CSV/Excel vers Delta Lake.
+
+## 🚀 Fonctionnalités
+
+- ✅ Support multi-environnement (Local / Databricks)
+- ✅ 4 modes d'ingestion (FULL_SNAPSHOT, DELTA_FROM_LOT, etc.)
+- ✅ Validation de données complète
+- ✅ Logging et observabilité
+- ✅ Gestion des erreurs et bad records
+- ✅ Optimisé pour gros volumes
+
+## 📦 Installation
+
+### Mode Local (Test)
+
+```bash
+# Cloner le repository
+git clone <your-repo>
+cd wax_pipeline
+
+# Créer environnement virtuel
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# ou
+venv\\Scripts\\activate  # Windows
+
+# Installer les dépendances
+pip install -r requirements.txt
+
+# Préparer les données
+mkdir -p data/input data/temp data/output
+# Placez vos fichiers ZIP et Excel dans data/input/
+```
+
+### Mode Databricks (Production)
+
+```bash
+# Uploader le package sur Databricks
+databricks fs cp -r src/ dbfs:/wax_pipeline/src/
+
+# Créer un notebook avec le contenu de notebooks/wax_databricks.py
+# Ou utiliser le notebook Databricks directement
+```
+
+## 🎯 Usage
+
+### Exécution Locale
+
+```bash
+# Mode interactif
+python src/main.py
+
+# Avec paramètres personnalisés
+python src/main.py --zip data/input/site.zip --excel data/input/config.xlsx
+```
+
+### Exécution Databricks
+
+1. Créer un notebook Databricks
+2. Copier le contenu de `notebooks/wax_databricks.py`
+3. Configurer les widgets
+4. Exécuter
+
+## 📊 Configuration
+
+Le fichier Excel de configuration doit contenir 2 sheets :
+
+### Sheet 1: Field-Column
+- Column Name
+- Field Type (STRING, INTEGER, DATE, etc.)
+- Is Nullable
+- Transformation Type
+- isMergeKey
+- isExtractValidity
+
+### Sheet 2: File-Table
+- Delta Table Name
+- Filename Pattern
+- Input Format
+- Input delimiter
+- Ingestion mode
+- Rejected line per file tolerance
+
+## 🔧 Modes d'Ingestion
+
+1. **FULL_SNAPSHOT** : Écrase complètement la table
+2. **DELTA_FROM_LOT** : Ajout simple (append)
+3. **DELTA_FROM_NON_HISTORIZED** : Merge avec mise à jour
+4. **FULL_KEY_REPLACE** : Suppression puis insertion par clé
+
+## 📝 Logs
+
+Les logs sont générés dans :
+- `/mnt/logs/wax_execution_logs_delta` (logs d'exécution)
+- `/mnt/logs/wax_data_quality_errors_delta` (logs qualité)
+
+## 🧪 Tests
+
+```bash
+# Exécuter tous les tests
+pytest tests/
+
+# Avec coverage
+pytest --cov=src tests/
+```
+
+## 📚 Documentation
+
+Voir la documentation complète : [docs/](docs/)
+
+## 🤝 Contributing
+
+1. Fork le projet
+2. Créer une branche feature
+3. Commiter vos changements
+4. Pousser sur la branche
+5. Ouvrir une Pull Request
+
+## 📄 License
+
+MIT License - voir LICENSE file
+
+## 👥 Authors
+
+WAX Team - Data Engineering
+
+## 📞 Support
+
+Pour tout problème : <support@example.com>
+"""
+
+# ============================================================================
+# FICHIER 2: requirements.txt
+# ============================================================================
+"""
+# Core dependencies
+pyspark==3.5.0
+pandas==2.1.4
+openpyxl==3.1.2
+delta-spark==3.0.0
+
+# Databricks (optionnel pour local)
+# databricks-connect==13.3.0
+
+# Testing
+pytest==7.4.3
+pytest-cov==4.1.0
+pytest-mock==3.12.0
+
+# Code quality
+black==23.12.1
+flake8==6.1.0
+mypy==1.7.1
+
+# Development
+ipython==8.18.1
+jupyter==1.0.0
+"""
+
+# ============================================================================
+# FICHIER 3: setup.py
+# ============================================================================
+"""
+from setuptools import setup, find_packages
+
+setup(
+    name="wax-pipeline",
+    version="1.0.0",
+    description="Pipeline ETL pour ingestion de données dans Delta Lake",
+    author="WAX Team",
+    author_email="wax@example.com",
+    packages=find_packages(where="src"),
+    package_dir={"": "src"},
+    install_requires=[
+        "pyspark>=3.5.0",
+        "pandas>=2.1.0",
+        "openpyxl>=3.1.0",
+        "delta-spark>=3.0.0",
+    ],
+    extras_require={
+        "dev": [
+            "pytest>=7.4.0",
+            "pytest-cov>=4.1.0",
+            "black>=23.12.0",
+            "flake8>=6.1.0",
+            "mypy>=1.7.0",
+        ]
+    },
+    python_requires=">=3.9",
+    entry_points={
+        "console_scripts": [
+            "wax-pipeline=main:main",
+        ],
+    },
+    classifiers=[
+        "Development Status :: 4 - Beta",
+        "Intended Audience :: Developers",
+        "Topic :: Software Development :: Libraries",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+    ],
+)
+"""
+
+# ============================================================================
+# FICHIER 4: .gitignore
+# ============================================================================
+"""
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data
+data/temp/*
+data/output/*
+*.csv
+*.zip
+*.parquet
+
+# Logs
+*.log
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Spark
+metastore_db/
+derby.log
+spark-warehouse/
+
+# Keep folder structure
+!data/input/.gitkeep
+!data/temp/.gitkeep
+!data/output/.gitkeep
+"""
+
+# ============================================================================
+# FICHIER 5: src/__init__.py (CORRIGÉ)
+# ============================================================================
+"""
+WAX Pipeline - Data Ingestion Framework
+Version: 1.0.0
+Description: Pipeline ETL pour l'ingestion de données dans Delta Lake
+"""
+
+__version__ = "1.0.0"
+__author__ = "WAX Team"
+__all__ = [
+    "config",
+    "utils",
+    "validators",
+    "delta_manager",
+    "logging_manager",
+    "ingestion",
+    "file_processor",
+    "main"
+]
+
+# ============================================================================
+# Les autres fichiers suivent dans les prochains messages...
+# Pour obtenir le ZIP complet, je vais créer chaque fichier corrigé.
+# ============================================================================
+"""
+-------------------------------------------->
+-------------------------------------------->
+
+"""
+Configuration Management
+Gère les paramètres pour Databricks et mode local
+"""
+
+import os
+from typing import Dict, Any, Optional
+
+
+# ================================================================================
+# 🔧 CONFIGURATION POUR DATABRICKS
+# ================================================================================
+
+def get_databricks_config(dbutils) -> Dict[str, Any]:
+    """
+    Récupère la configuration depuis les widgets Databricks
+
+    Args:
+        dbutils: L'objet dbutils de Databricks
+
+    Returns:
+        Dict contenant tous les paramètres
+    """
+    # Création des widgets
+    dbutils.widgets.text("zip_path", "dbfs:/FileStore/tables/site_20251201_120001.zip", "📦 Source ZIP")
+    dbutils.widgets.text("excel_path", "dbfs:/FileStore/tables/waxsite_config.xlsx", "📑 Excel Config")
+    dbutils.widgets.text("extract_dir", "dbfs:/tmp/unzipped_wax_csvs", "📂 Dossier Extraction ZIP")
+    dbutils.widgets.text("log_exec_path", "/mnt/logs/wax_execution_logs_delta", "📝 Logs Exécution (Delta)")
+    dbutils.widgets.text("log_quality_path", "/mnt/logs/wax_data_quality_errors_delta", "🚦 Logs Qualité (Delta)")
+    dbutils.widgets.text("env", "dev", "🌍 Environnement")
+    dbutils.widgets.text("version", "v1", "📖 Version Pipeline")
+
+    # Lecture des paramètres
+    params = {
+        k: dbutils.widgets.get(k) for k in [
+            "zip_path",
+            "excel_path",
+            "extract_dir",
+            "log_exec_path",
+            "log_quality_path",
+            "env",
+            "version"
+        ]
+    }
+
+    return params
+
+
+# ================================================================================
+# 💻 CONFIGURATION POUR MODE LOCAL (TEST)
+# ================================================================================
+
+def get_local_config(base_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Configuration pour les tests en local
+
+    Args:
+        base_path: Chemin de base du projet (auto-détecté si None)
+
+    Returns:
+        Dict contenant tous les paramètres avec chemins locaux
+    """
+    if base_path is None:
+        # Auto-détection du chemin de base
+        base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    params = {
+        "zip_path": os.path.join(base_path, "data", "input", "site_20251201_120001.zip"),
+        "excel_path": os.path.join(base_path, "data", "input", "waxsite_config.xlsx"),
+        "extract_dir": os.path.join(base_path, "data", "temp", "unzipped"),
+        "log_exec_path": os.path.join(base_path, "data", "output", "logs_execution"),
+        "log_quality_path": os.path.join(base_path, "data", "output", "logs_quality"),
+        "env": "local",
+        "version": "v1"
+    }
+
+    # Créer les dossiers nécessaires
+    for key in ["extract_dir", "log_exec_path", "log_quality_path"]:
+        os.makedirs(params[key], exist_ok=True)
+
+    # Créer aussi le dossier input si absent
+    input_dir = os.path.join(base_path, "data", "input")
+    os.makedirs(input_dir, exist_ok=True)
+
+    return params
+
+
+# ================================================================================
+# 📄 FONCTION DE DÉTECTION AUTOMATIQUE
+# ================================================================================
+
+def is_databricks() -> bool:
+    """
+    Détecte si le code s'exécute sur Databricks
+
+    Returns:
+        True si sur Databricks, False sinon
+    """
+    try:
+        # Vérifier si nous sommes dans un environnement Databricks
+        return 'DATABRICKS_RUNTIME_VERSION' in os.environ
+    except:
+        return False
+
+
+def get_config(dbutils=None, base_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Détecte automatiquement l'environnement et retourne la config appropriée
+
+    Args:
+        dbutils: L'objet dbutils (None en local, présent sur Databricks)
+        base_path: Chemin de base pour mode local (auto-détecté si None)
+
+    Returns:
+        Dict contenant la configuration
+
+    Examples:
+        >>> # Mode local
+        >>> config = get_config()
+        
+        >>> # Mode Databricks
+        >>> config = get_config(dbutils)
+    """
+    # Auto-détection si dbutils n'est pas fourni
+    if dbutils is None and is_databricks():
+        try:
+            # Importer dbutils depuis l'environnement Databricks
+            from pyspark.dbutils import DBUtils
+            from pyspark.sql import SparkSession
+            spark = SparkSession.builder.getOrCreate()
+            dbutils = DBUtils(spark)
+        except:
+            pass
+
+    if dbutils is not None:
+        print("🌐 Mode: DATABRICKS détecté")
+        return get_databricks_config(dbutils)
+    else:
+        print("💻 Mode: LOCAL détecté (TEST)")
+        return get_local_config(base_path)
+
+
+# ================================================================================
+# 📋 AFFICHAGE DE LA CONFIGURATION
+# ================================================================================
+
+def print_config(params: Dict[str, Any]) -> None:
+    """
+    Affiche la configuration de manière lisible
+    
+    Args:
+        params: Dictionnaire de configuration
+    """
+    print("=" * 80)
+    print("📥 CONFIGURATION CHARGÉE")
+    print("=" * 80)
+    for key, value in params.items():
+        # Tronquer les chemins trop longs
+        display_value = value
+        if isinstance(value, str) and len(value) > 60:
+            display_value = "..." + value[-57:]
+        print(f"  {key:20s}: {display_value}")
+    print("=" * 80)
+
+
+# ================================================================================
+# 🔐 VALIDATION DE LA CONFIGURATION
+# ================================================================================
+
+def validate_config(params: Dict[str, Any]) -> tuple[bool, list[str]]:
+    """
+    Valide la configuration et retourne les erreurs éventuelles
+    
+    Args:
+        params: Dictionnaire de configuration
+        
+    Returns:
+        Tuple (is_valid, errors)
+        - is_valid: True si config valide
+        - errors: Liste des messages d'erreur
+    """
+    errors = []
+    
+    # Vérifier les clés obligatoires
+    required_keys = ["zip_path", "excel_path", "extract_dir", "log_exec_path", "log_quality_path", "env", "version"]
+    
+    for key in required_keys:
+        if key not in params:
+            errors.append(f"❌ Clé manquante: {key}")
+        elif not params[key]:
+            errors.append(f"❌ Valeur vide pour: {key}")
+    
+    # Vérifier l'existence des fichiers en mode local
+    if params.get("env") == "local":
+        # Vérifier ZIP
+        if not os.path.exists(params.get("zip_path", "")):
+            errors.append(f"❌ Fichier ZIP introuvable: {params.get('zip_path')}")
+        
+        # Vérifier Excel
+        if not os.path.exists(params.get("excel_path", "")):
+            errors.append(f"❌ Fichier Excel introuvable: {params.get('excel_path')}")
+    
+    is_valid = len(errors) == 0
+    
+    if not is_valid:
+        print("\n⚠️  ERREURS DE CONFIGURATION:")
+        for error in errors:
+            print(f"  {error}")
+    
+    return is_valid, errors
+
+
+------------------------------>
+------------------------------>
+
+
+# 📦 WAX Pipeline - Package Complet
+
+## 🎯 Structure du Projet
+
+Créez cette arborescence sur votre système :
+
+```
+wax_pipeline/
+├── README.md
+├── requirements.txt
+├── setup.py
+├── .gitignore
+├── data/
+│   ├── input/
+│   │   └── .gitkeep
+│   ├── temp/
+│   │   └── .gitkeep
+│   └── output/
+│       └── .gitkeep
+├── src/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── utils.py
+│   ├── validators.py
+│   ├── delta_manager.py
+│   ├── logging_manager.py
+│   ├── ingestion.py
+│   ├── file_processor.py
+│   └── main.py
+├── tests/
+│   ├── __init__.py
+│   ├── test_utils.py
+│   └── test_validators.py
+└── notebooks/
+    └── wax_databricks.py
+```
+
+---
+
+## 📄 Contenu des Fichiers
+
+### 1️⃣ README.md
+
+```markdown
+# WAX Pipeline - Data Ingestion Framework
+
+Pipeline ETL industriel pour l'ingestion de données CSV/Excel vers Delta Lake.
+
+## 🚀 Installation
+
+```bash
+# Cloner et installer
+git clone <your-repo>
+cd wax_pipeline
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+## 🎯 Usage
+
+### Mode Local
+```bash
+python src/main.py
+```
+
+### Mode Databricks
+Utiliser le notebook `notebooks/wax_databricks.py`
+
+## 📊 Configuration
+
+Le fichier Excel doit contenir 2 sheets :
+- **Field-Column** : Métadonnées des colonnes
+- **File-Table** : Paramètres des fichiers
+
+## 🔧 Modes d'Ingestion
+
+1. **FULL_SNAPSHOT** : Écrase complètement
+2. **DELTA_FROM_LOT** : Append simple
+3. **DELTA_FROM_NON_HISTORIZED** : Merge avec update
+4. **FULL_KEY_REPLACE** : Delete + Insert
+
+## 📝 Logs
+
+- Exécution : `/mnt/logs/wax_execution_logs_delta`
+- Qualité : `/mnt/logs/wax_data_quality_errors_delta`
+
+## 🧪 Tests
+
+```bash
+pytest tests/
+```
+```
+
+---
+
+### 2️⃣ requirements.txt
+
+```
+pyspark==3.5.0
+pandas==2.1.4
+openpyxl==3.1.2
+delta-spark==3.0.0
+pytest==7.4.3
+pytest-cov==4.1.0
+black==23.12.1
+flake8==6.1.0
+```
+
+---
+
+### 3️⃣ setup.py
+
+```python
+from setuptools import setup, find_packages
+
+setup(
+    name="wax-pipeline",
+    version="1.0.0",
+    description="Pipeline ETL pour ingestion Delta Lake",
+    author="WAX Team",
+    packages=find_packages(where="src"),
+    package_dir={"": "src"},
+    install_requires=[
+        "pyspark>=3.5.0",
+        "pandas>=2.1.0",
+        "openpyxl>=3.1.0",
+        "delta-spark>=3.0.0",
+    ],
+    python_requires=">=3.9",
+    entry_points={
+        "console_scripts": [
+            "wax-pipeline=main:main",
+        ],
+    },
+)
+```
+
+---
+
+### 4️⃣ .gitignore
+
+```
+__pycache__/
+*.py[cod]
+venv/
+.vscode/
+.idea/
+data/temp/*
+data/output/*
+*.csv
+*.zip
+*.log
+.DS_Store
+metastore_db/
+spark-warehouse/
+!data/**/.gitkeep
+```
+
+---
+
+### 5️⃣ src/__init__.py
+
+```python
+"""
+WAX Pipeline - Data Ingestion Framework
+Version: 1.0.0
+"""
+
+__version__ = "1.0.0"
+__author__ = "WAX Team"
+```
+
+---
+
+### 6️⃣ tests/__init__.py
+
+```python
+"""
+Tests for WAX Pipeline
+"""
+```
+
+---
+
+### 7️⃣ tests/test_utils.py
+
+```python
+import pytest
+from src.utils import parse_bool, normalize_delimiter, parse_tolerance
+
+
+def test_parse_bool():
+    assert parse_bool("true") == True
+    assert parse_bool("0") == False
+    assert parse_bool(None, default=True) == True
+    assert parse_bool("yes") == True
+
+
+def test_normalize_delimiter():
+    assert normalize_delimiter(",") == ","
+    assert normalize_delimiter(";") == ";"
+    assert normalize_delimiter(None) == ","
+    
+    with pytest.raises(ValueError):
+        normalize_delimiter(";;")
+
+
+def test_parse_tolerance():
+    assert parse_tolerance("10%", 1000) == 0.1
+    assert parse_tolerance("50", 1000) == 0.05
+    assert parse_tolerance(None, 1000, default="5%") == 0.05
+```
+
+---
+
+### 8️⃣ tests/test_validators.py
+
+```python
+import pytest
+from pyspark.sql import SparkSession
+from src.validators import spark_type_from_config
+import pandas as pd
+
+
+@pytest.fixture(scope="module")
+def spark():
+    return SparkSession.builder.master("local[2]").appName("test").getOrCreate()
+
+
+def test_spark_type_from_config():
+    row = pd.Series({"Field Type": "STRING"})
+    from pyspark.sql.types import StringType
+    assert isinstance(spark_type_from_config(row), StringType)
+    
+    row = pd.Series({"Field Type": "INTEGER"})
+    from pyspark.sql.types import IntegerType
+    assert isinstance(spark_type_from_config(row), IntegerType)
+```
+
+---
+
+### 9️⃣ data/input/.gitkeep, data/temp/.gitkeep, data/output/.gitkeep
+
+```
+# Fichier vide pour garder la structure des dossiers dans Git
+```
+
+---
+
+## 🚀 Installation Rapide
+
+### Étape 1 : Créer la structure
+
+```bash
+# Créer le dossier principal
+mkdir wax_pipeline
+cd wax_pipeline
+
+# Créer les sous-dossiers
+mkdir -p data/input data/temp data/output
+mkdir -p src tests notebooks
+
+# Créer les fichiers .gitkeep
+touch data/input/.gitkeep data/temp/.gitkeep data/output/.gitkeep
+```
+
+### Étape 2 : Copier les fichiers Python
+
+Copiez tous les fichiers Python que je vous ai fournis dans les bons dossiers :
+
+- **src/** : Tous les fichiers .py principaux
+- **tests/** : Les fichiers de tests
+- **notebooks/** : Le notebook Databricks
+
+### Étape 3 : Installer les dépendances
+
+```bash
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# ou venv\Scripts\activate sur Windows
+
+pip install -r requirements.txt
+```
+
+### Étape 4 : Préparer les données
+
+```bash
+# Placer vos fichiers dans data/input/
+cp /path/to/your/site.zip data/input/
+cp /path/to/your/config.xlsx data/input/
+```
+
+### Étape 5 : Exécuter
+
+```bash
+python src/main.py
+```
+
+---
+
+## 📥 Téléchargement
+
+Comme je ne peux pas créer de fichier ZIP directement, voici **3 options** pour obtenir le projet complet :
+
+### Option 1 : Script Bash (Linux/Mac)
+
+Créez un fichier `create_wax_project.sh` :
+
+```bash
+#!/bin/bash
+
+# Créer la structure
+mkdir -p wax_pipeline/{data/{input,temp,output},src,tests,notebooks}
+cd wax_pipeline
+
+# Créer README.md
+cat > README.md << 'EOF'
+# WAX Pipeline
+Pipeline ETL pour Delta Lake
+EOF
+
+# Créer requirements.txt
+cat > requirements.txt << 'EOF'
+pyspark==3.5.0
+pandas==2.1.4
+openpyxl==3.1.2
+delta-spark==3.0.0
+EOF
+
+# Créer .gitkeep
+touch data/input/.gitkeep data/temp/.gitkeep data/output/.gitkeep
+touch src/__init__.py tests/__init__.py
+
+echo "✅ Structure créée ! Copiez maintenant les fichiers Python."
+```
+
+Exécutez :
+```bash
+chmod +x create_wax_project.sh
+./create_wax_project.sh
+```
+
+### Option 2 : Script PowerShell (Windows)
+
+```powershell
+# Créer la structure
+New-Item -ItemType Directory -Path "wax_pipeline\data\input","wax_pipeline\data\temp","wax_pipeline\data\output","wax_pipeline\src","wax_pipeline\tests","wax_pipeline\notebooks" -Force
+
+# Créer fichiers vides
+New-Item -ItemType File -Path "wax_pipeline\data\input\.gitkeep","wax_pipeline\src\__init__.py","wax_pipeline\tests\__init__.py" -Force
+
+Write-Host "✅ Structure créée !"
+```
+
+### Option 3 : GitHub Repository
+
+Je recommande de créer un repository Git :
+
+```bash
+cd wax_pipeline
+git init
+git add .
+git commit -m "Initial commit"
+git remote add origin <your-github-repo>
+git push -u origin main
+```
+
+---
+
+## 🔧 Fichiers Manquants à Copier
+
+Je vous ai fourni précédemment les fichiers Python complets. Copiez-les dans les bons dossiers :
+
+### À copier dans `src/` :
+- ✅ `config.py` (fourni précédemment)
+- ✅ `utils.py` (dans votre document 9)
+- ✅ `validators.py` (dans votre document 10)
+- ✅ `delta_manager.py` (dans votre document 4)
+- ✅ `logging_manager.py` (dans votre document 7)
+- ✅ `ingestion.py` (dans votre document 6)
+- ✅ `file_processor.py` (dans votre document 5)
+- ✅ `main.py` (dans votre document 8)
+
+### À créer dans `notebooks/` :
+
+**wax_databricks.py** :
+
+```python
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # WAX Pipeline - Databricks
+
+# COMMAND ----------
+
+# Installation des dépendances
+%pip install openpyxl
+
+# COMMAND ----------
+
+# Import du module principal
+import sys
+sys.path.append("/dbfs/wax_pipeline/src")
+
+from main import main
+
+# COMMAND ----------
+
+# Exécution du pipeline
+main()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Résultats
+# MAGIC 
+# MAGIC Vérifier les logs :
+# MAGIC - `/mnt/logs/wax_execution_logs_delta`
+# MAGIC - `/mnt/logs/wax_data_quality_errors_delta`
+```
+
+---
+
+## ✅ Vérification de l'Installation
+
+```bash
+# Vérifier la structure
+tree wax_pipeline
+
+# Tester l'import
+cd wax_pipeline
+python -c "from src import config; print('✅ Import OK')"
+
+# Lancer les tests
+pytest tests/ -v
+
+# Exécuter le pipeline
+python src/main.py
+```
+
+---
+
+## 📞 Support
+
+Pour toute question, référez-vous aux documents fournis ou consultez la documentation inline dans chaque fichier Python.
+
+**Tous les fichiers Python sont fournis dans les documents précédents. Copiez-les dans la structure ci-dessus.**
+
+
+
+---------------------->
+---------------------->
+
+#!/usr/bin/env python3
+"""
+WAX Pipeline Generator
+Génère automatiquement la structure complète du projet WAX Pipeline
+
+Usage:
+    python generate_wax_pipeline.py
+    
+Cela créera un dossier 'wax_pipeline/' avec tous les fichiers nécessaires.
+"""
+
+import os
+import shutil
+from pathlib import Path
+
+
+def create_directory_structure(base_path: str):
+    """Crée la structure de dossiers"""
+    dirs = [
+        "data/input",
+        "data/temp",
+        "data/output",
+        "src",
+        "tests",
+        "notebooks",
+    ]
+    
+    for d in dirs:
+        path = os.path.join(base_path, d)
+        os.makedirs(path, exist_ok=True)
+        print(f"✅ Créé: {path}")
+
+
+def create_file(base_path: str, filepath: str, content: str):
+    """Crée un fichier avec son contenu"""
+    full_path = os.path.join(base_path, filepath)
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    
+    with open(full_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    
+    print(f"✅ Créé: {filepath}")
+
+
+def generate_project():
+    """Génère le projet complet"""
+    base_path = "wax_pipeline"
+    
+    print("=" * 80)
+    print("🚀 GÉNÉRATION DU PROJET WAX PIPELINE")
+    print("=" * 80)
+    
+    # Supprimer le dossier existant si présent
+    if os.path.exists(base_path):
+        response = input(f"⚠️  Le dossier '{base_path}' existe déjà. Le supprimer ? (y/n): ")
+        if response.lower() == 'y':
+            shutil.rmtree(base_path)
+            print(f"🗑️  Dossier supprimé: {base_path}")
+        else:
+            print("❌ Annulé")
+            return
+    
+    # Créer la structure
+    print("\n📁 Création de la structure...")
+    create_directory_structure(base_path)
+    
+    # README.md
+    create_file(base_path, "README.md", """# WAX Pipeline - Data Ingestion Framework
+
+Pipeline ETL industriel pour l'ingestion de données CSV/Excel vers Delta Lake.
+
+## 🚀 Installation
+
+```bash
+cd wax_pipeline
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# ou venv\\Scripts\\activate sur Windows
+pip install -r requirements.txt
+```
+
+## 🎯 Usage
+
+### Mode Local
+```bash
+python src/main.py
+```
+
+### Mode Databricks
+Utiliser le notebook `notebooks/wax_databricks.py`
+
+## 📊 Configuration
+
+Le fichier Excel doit contenir 2 sheets :
+- **Field-Column** : Métadonnées des colonnes  
+- **File-Table** : Paramètres des fichiers
+
+## 🔧 Modes d'Ingestion
+
+1. **FULL_SNAPSHOT** : Écrase complètement la table
+2. **DELTA_FROM_LOT** : Ajout simple (append)
+3. **DELTA_FROM_NON_HISTORIZED** : Merge avec mise à jour
+4. **FULL_KEY_REPLACE** : Suppression puis insertion par clé
+
+## 📝 Logs
+
+- Exécution : `/mnt/logs/wax_execution_logs_delta`
+- Qualité : `/mnt/logs/wax_data_quality_errors_delta`
+
+## 🧪 Tests
+
+```bash
+pytest tests/
+```
+
+## 📄 License
+
+MIT License
+""")
+    
+    # requirements.txt
+    create_file(base_path, "requirements.txt", """pyspark==3.5.0
+pandas==2.1.4
+openpyxl==3.1.2
+delta-spark==3.0.0
+pytest==7.4.3
+pytest-cov==4.1.0
+black==23.12.1
+flake8==6.1.0
+""")
+    
+    # setup.py
+    create_file(base_path, "setup.py", """from setuptools import setup, find_packages
+
+setup(
+    name="wax-pipeline",
+    version="1.0.0",
+    description="Pipeline ETL pour ingestion Delta Lake",
+    author="WAX Team",
+    packages=find_packages(where="src"),
+    package_dir={"": "src"},
+    install_requires=[
+        "pyspark>=3.5.0",
+        "pandas>=2.1.0",
+        "openpyxl>=3.1.0",
+        "delta-spark>=3.0.0",
+    ],
+    python_requires=">=3.9",
+    entry_points={
+        "console_scripts": [
+            "wax-pipeline=main:main",
+        ],
+    },
+)
+""")
+    
+    # .gitignore
+    create_file(base_path, ".gitignore", """__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+venv/
+ENV/
+.vscode/
+.idea/
+*.swp
+data/temp/*
+data/output/*
+*.csv
+*.zip
+*.parquet
+*.log
+logs/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+metastore_db/
+derby.log
+spark-warehouse/
+!data/**/.gitkeep
+""")
+    
+    # .gitkeep files
+    for d in ["data/input", "data/temp", "data/output"]:
+        create_file(base_path, f"{d}/.gitkeep", "")
+    
+    # src/__init__.py
+    create_file(base_path, "src/__init__.py", '''"""
+WAX Pipeline - Data Ingestion Framework
+Version: 1.0.0
+"""
+
+__version__ = "1.0.0"
+__author__ = "WAX Team"
+''')
+    
+    # tests/__init__.py
+    create_file(base_path, "tests/__init__.py", '''"""Tests for WAX Pipeline"""
+''')
+    
+    print("\n" + "=" * 80)
+    print("✅ PROJET GÉNÉRÉ AVEC SUCCÈS !")
+    print("=" * 80)
+    print(f"\n📁 Le projet a été créé dans : {os.path.abspath(base_path)}")
+    print("\n📋 Prochaines étapes :")
+    print("   1. cd wax_pipeline")
+    print("   2. Copiez vos fichiers Python corrigés dans src/")
+    print("      (config.py, utils.py, validators.py, etc.)")
+    print("   3. Placez vos données dans data/input/")
+    print("   4. python -m venv venv && source venv/bin/activate")
+    print("   5. pip install -r requirements.txt")
+    print("   6. python src/main.py")
+    print("\n" + "=" * 80)
+
+
+if __name__ == "__main__":
+    generate_project()
