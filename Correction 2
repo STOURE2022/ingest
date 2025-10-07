@@ -1,0 +1,40 @@
+import os
+from pyspark.sql import SparkSession
+
+# =========================================================
+# 🔧 Détection environnement (local vs Databricks)
+# =========================================================
+def is_databricks():
+    """
+    Détecte si on est dans un environnement Databricks.
+    """
+    return "DATABRICKS_RUNTIME_VERSION" in os.environ
+
+
+# =========================================================
+# 📂 Liste des fichiers (compatible local + Databricks)
+# =========================================================
+def list_files(extract_dir: str, spark: SparkSession = None):
+    """
+    Liste les fichiers dans un dossier local ou sur Databricks.
+    - Si Databricks : utilise dbutils.fs.ls()
+    - Si local : utilise os.listdir()
+    """
+    if is_databricks():
+        try:
+            from pyspark.dbutils import DBUtils
+            dbutils = DBUtils(spark)
+            files = [f.path for f in dbutils.fs.ls(extract_dir)]
+            print(f"📂 Fichiers détectés sur DBFS : {len(files)} trouvés")
+            return files
+        except Exception as e:
+            print(f"⚠️ Erreur DBFS ({e}) → fallback local")
+    
+    # Mode local (par défaut)
+    if os.path.exists(extract_dir):
+        files = [os.path.join(extract_dir, f) for f in os.listdir(extract_dir)]
+        print(f"📂 Fichiers locaux détectés : {len(files)} trouvés")
+        return files
+    else:
+        print(f"❌ Dossier inexistant : {extract_dir}")
+        return []
