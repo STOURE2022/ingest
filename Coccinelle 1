@@ -1,0 +1,117 @@
+"""
+Configuration Management - CORRECTION FINALE
+Pour structure: .databricks/wax_ingestion_main/
+"""
+
+import os
+from typing import Dict, Any
+
+
+def get_local_config() -> Dict[str, Any]:
+    """Configuration pour mode local - CORRECTION STRUCTURE DATABRICKS"""
+    
+    # 🔧 CORRECTION: Détecter si on est dans .databricks/wax_ingestion_main/src/
+    current_file = os.path.abspath(__file__)
+    print(f"🔍 Fichier actuel: {current_file}")
+    
+    src_dir = os.path.dirname(current_file)
+    print(f"🔍 Dossier src: {src_dir}")
+    
+    # Si on est dans .../wax_ingestion_main/src/, remonter d'un niveau
+    if src_dir.endswith("src"):
+        base = os.path.dirname(src_dir)  # .../wax_ingestion_main/
+    else:
+        base = src_dir
+    
+    print(f"🔍 Dossier de base: {base}")
+    
+    # ✅ Les fichiers sont directement dans data/input/ (pas src/data/input/)
+    params = {
+        "zip_path": os.path.join(base, "data", "input", "site_20251606_120015.zip"),
+        "excel_path": os.path.join(base, "data", "input", "waxsite_config.xlsx"),
+        "extract_dir": os.path.join(base, "data", "temp", "unzipped"),
+        "log_exec_path": os.path.join(base, "data", "output", "logs_execution"),
+        "log_quality_path": os.path.join(base, "data", "output", "logs_quality"),
+        "env": "local",
+        "version": "v1"
+    }
+    
+    # Créer les dossiers nécessaires
+    for key in ["extract_dir", "log_exec_path", "log_quality_path"]:
+        try:
+            os.makedirs(params[key], exist_ok=True)
+            print(f"✅ Dossier créé/vérifié: {params[key]}")
+        except Exception as e:
+            print(f"⚠️  Erreur création dossier {key}: {e}")
+    
+    # Vérification des fichiers
+    print("\n📂 Vérification des fichiers:")
+    for key in ["zip_path", "excel_path"]:
+        path = params[key]
+        if os.path.exists(path):
+            size = os.path.getsize(path)
+            print(f"  ✅ {key}: {path} ({size:,} bytes)")
+        else:
+            print(f"  ❌ {key}: {path} - FICHIER MANQUANT!")
+            # Chercher le fichier dans d'autres emplacements
+            filename = os.path.basename(path)
+            search_dirs = [
+                base,
+                os.path.join(base, "data"),
+                os.path.join(base, "data", "input"),
+                os.path.join(base, "src", "data", "input"),
+            ]
+            print(f"     🔍 Recherche de {filename}...")
+            for search_dir in search_dirs:
+                test_path = os.path.join(search_dir, filename)
+                if os.path.exists(test_path):
+                    print(f"     ✅ TROUVÉ: {test_path}")
+                    # Mettre à jour le chemin
+                    params[key] = test_path
+                    break
+    
+    return params
+
+
+def get_databricks_config(dbutils) -> Dict[str, Any]:
+    """Configuration pour Databricks Cloud"""
+    dbutils.widgets.text("zip_path", "dbfs:/FileStore/tables/site_20251606_120015.zip", "📦 ZIP")
+    dbutils.widgets.text("excel_path", "dbfs:/FileStore/tables/waxsite_config.xlsx", "📑 Excel")
+    dbutils.widgets.text("extract_dir", "dbfs:/tmp/unzipped", "📂 Extract")
+    dbutils.widgets.text("log_exec_path", "/mnt/logs/wax_execution_logs_delta", "📝 Logs Exec")
+    dbutils.widgets.text("log_quality_path", "/mnt/logs/wax_data_quality_errors_delta", "🚦 Logs Quality")
+    dbutils.widgets.text("env", "dev", "🌍 Env")
+    dbutils.widgets.text("version", "v1", "📖 Version")
+    
+    return {k: dbutils.widgets.get(k) for k in [
+        "zip_path", "excel_path", "extract_dir", 
+        "log_exec_path", "log_quality_path", "env", "version"
+    ]}
+
+
+def is_databricks() -> bool:
+    """Détecte si on est sur Databricks Cloud"""
+    return 'DATABRICKS_RUNTIME_VERSION' in os.environ
+
+
+def get_config(dbutils=None) -> Dict[str, Any]:
+    """Auto-détection de l'environnement"""
+    if dbutils is not None or is_databricks():
+        print("🌐 Mode DATABRICKS CLOUD")
+        return get_databricks_config(dbutils)
+    else:
+        print("💻 Mode LOCAL (Databricks Connect)")
+        return get_local_config()
+
+
+def print_config(params: Dict[str, Any]):
+    """Affiche la configuration"""
+    print("\n" + "="*80)
+    print("📥 CONFIGURATION CHARGÉE")
+    print("="*80)
+    for k, v in params.items():
+        exists = ""
+        if k in ["zip_path", "excel_path"]:
+            exists = " ✅" if os.path.exists(v) else " ❌ MANQUANT"
+        print(f"  {k:20s}: {v}{exists}")
+    print("="*80 + "\n")
