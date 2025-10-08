@@ -1,0 +1,101 @@
+# =====================================================================
+# VALIDATION DE TYPES (cast sécurisé final)
+# =====================================================================
+
+print(f"🔧 Validation des types de colonnes...")
+column_errors = {}
+
+for _, col_def in file_columns_df[file_columns_df["Delta Table Name"] == source_table].iterrows():
+    cname = str(col_def.get("Column Name")).strip()
+    expected_type = str(col_def.get("Field type")).strip().upper()
+    is_nullable = parse_bool(col_def.get("Is Nullable", "true"), True)
+    
+    if cname not in df_raw.columns or expected_type not in TYPE_MAPPING:
+        continue
+    
+    # ✅ CORRECTION : Nettoyer les valeurs vides AVANT le cast
+    df_raw = df_raw.withColumn(
+        cname,
+        F.when(
+            (F.col(cname).isNull()) | 
+            (F.trim(F.col(cname)) == ""),
+            F.lit(None)
+        ).otherwise(F.col(cname))
+    )
+    
+    # Cast sécurisé APRÈS nettoyage
+    safe_cast = df_raw.withColumn(
+        f"{cname}_cast",
+        F.expr(f"try_cast({cname} as {expected_type})")
+    )
+    
+    # Détection erreurs de type (seulement sur valeurs NON vides)
+    invalid_rows = safe_cast.filter(
+        F.col(f"{cname}_cast").isNull() & 
+        F.col(cname).isNotNull()
+    )
+    
+    invalid_count = invalid_rows.count()
+    
+    if invalid_count > 0:
+        print(f"   ⚠️ {invalid_count} erreurs de type sur {cname}")
+        
+        if "line_id" not in invalid_rows.columns:
+            invalid_rows = invalid_rows.withColumn(
+                "line_id",
+                F.row_number().over(Window.orderBy(F.monotonically_increasing_id()))
+            )
+        
+        # Log erreurs (limite 1000)
+        err = invalid_rows.limit(1000).select(
+            F.lit(source_table).alias("table_name"),
+            F.lit(filename_for_log).alias("filename"),
+            F.col("line_id"),
+            F.lit(cname).alias("column_name"),
+            F.concat(
+                F.lit(f"TYPE MISMATCH: Expected {expected_type}, found: "),
+                F.col(cname).cast("string")
+            ).alias("error_message"),
+            F.lit(1).alias("error_count")
+        )
+        
+        df_err_global = df_err_global.unionByName(err, allowMissingColumns=True)
+        
+        # Accumulation pour résumé
+        if cname not in column_errors:
+            column_errors[cname] = []
+        column_errors[cname].append(f"{invalid_count} type mismatches")
+    
+    # Remplacement par valeur castée
+    df_raw = safe_cast.drop(cname).withColumnRenamed(f"{cname}_cast", cname)
+    
+    # Contrôle nullabilité
+    if not is_nullable:
+        null_rows = df_raw.filter(F.col(cname).isNull())
+        null_count = null_rows.count()
+        
+        if null_count > 0:
+            print(f"   ⚠️ {null_count} valeurs nulles sur {cname} (non autorisées)")
+            
+            if "line_id" not in null_rows.columns:
+                null_rows = null_rows.withColumn(
+                    "line_id",
+                    F.row_number().over(Window.orderBy(F.monotonically_increasing_id()))
+                )
+            
+            # Log erreurs (limite 1000)
+            err = null_rows.limit(1000).select(
+                F.lit(source_table).alias("table_name"),
+                F.lit(filename_for_log).alias("filename"),
+                F.col("line_id"),
+                F.lit(cname).alias("column_name"),
+                F.lit(f"Null value detected [not authorized], ICT count incremented").alias("error_message"),
+                F.lit(1).alias("error_count")
+            )
+            
+            df_err_global = df_err_global.unionByName(err, allowMissingColumns=True)
+            
+            # Accumulation pour résumé
+            if cname not in column_errors:
+                column_errors[cname] = []
+            column_errors[cname].append(f"{null_count} null values")
