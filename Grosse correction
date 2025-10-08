@@ -1,0 +1,201 @@
+Je vois une nouvelle erreur ! 🔍 Une erreur Spark lors de l'affichage du DataFrame d'erreurs.
+
+## ❌ **Erreur détectée**
+
+```
+Py4JavaError: An error occurred while calling o13282.javaToPython
+org.apache.spark.SparkException: Multiple failures in stage materialization
+```
+
+Cette erreur se produit lors de l'affichage des erreurs avec `display()`. C'est probablement dû à un problème de schéma ou de colonnes manquantes dans le DataFrame `df_err_global`.
+
+## 🔧 **Solution : Harmoniser le schéma du DataFrame d'erreurs**
+
+Le problème vient du fait que différentes parties du code ajoutent des colonnes différentes à `df_err_global`, créant un schéma incohérent.
+
+### **Remplacez la section "APERÇU DES ERREURS" par ce code corrigé :**
+
+```python
+# =====================================================================
+# APERÇU DES ERREURS - VERSION CORRIGÉE
+# =====================================================================
+
+print("\n📊 Aperçu des erreurs détectées :")
+
+if df_err_global is not None and not df_err_global.rdd.isEmpty():
+    try:
+        # ✅ Normaliser le schéma avant affichage
+        # Assurer que toutes les colonnes attendues existent
+        required_columns = {
+            "table_name": StringType(),
+            "filename": StringType(),
+            "line_id": IntegerType(),
+            "column_name": StringType(),
+            "error_message": StringType(),
+            "error_count": IntegerType(),
+            "raw_value": StringType()
+        }
+        
+        # Ajouter les colonnes manquantes avec des valeurs NULL
+        for col_name, col_type in required_columns.items():
+            if col_name not in df_err_global.columns:
+                df_err_global = df_err_global.withColumn(col_name, F.lit(None).cast(col_type))
+        
+        # Sélectionner uniquement les colonnes dans l'ordre
+        df_err_display = df_err_global.select(
+            "table_name",
+            "filename",
+            "line_id",
+            "column_name",
+            "error_message",
+            "raw_value",
+            "error_count"
+        ).limit(100)
+        
+        # Affichage sécurisé
+        print(f"✅ {df_err_global.count()} erreur(s) détectée(s) au total (affichage des 100 premières)")
+        display(df_err_display)
+        
+    except Exception as e:
+        print(f"⚠️ Erreur lors de l'affichage : {e}")
+        print("📊 Résumé alternatif (agrégé) :")
+        
+        # Affichage alternatif en cas d'erreur
+        try:
+            summary = (
+                df_err_global
+                .groupBy("column_name", "error_message")
+                .agg(F.count("*").alias("total_errors"))
+                .orderBy(F.desc("total_errors"))
+                .limit(50)
+            )
+            display(summary)
+        except Exception as e2:
+            print(f"❌ Impossible d'afficher les erreurs : {e2}")
+            print("Colonnes disponibles :", df_err_global.columns if df_err_global else "None")
+else:
+    print("✅ Aucune erreur détectée")
+```
+
+## 🎯 **Solution alternative : Créer un schéma unifié dès le début**
+
+Pour éviter ce problème à l'avenir, définissez un schéma unique pour toutes les erreurs dès le départ :
+
+### **Ajoutez cette fonction au début du notebook (section "Validation qualité") :**
+
+```python
+def create_error_record(
+    table_name: str,
+    filename: str,
+    column_name: str,
+    error_message: str,
+    line_id: int = None,
+    raw_value: str = None,
+    error_count: int = 1
+) -> DataFrame:
+    """
+    Crée un DataFrame d'erreur avec schéma unifié
+    """
+    schema = StructType([
+        StructField("table_name", StringType(), True),
+        StructField("filename", StringType(), True),
+        StructField("line_id", IntegerType(), True),
+        StructField("column_name", StringType(), True),
+        StructField("error_message", StringType(), True),
+        StructField("raw_value", StringType(), True),
+        StructField("error_count", IntegerType(), True)
+    ])
+    
+    data = [(table_name, filename, line_id, column_name, error_message, raw_value, error_count)]
+    return spark.createDataFrame(data, schema)
+
+
+def create_error_dataframe_from_rows(
+    df: DataFrame,
+    table_name: str,
+    filename: str,
+    column_name: str,
+    error_message: str,
+    raw_value_col: str = None
+) -> DataFrame:
+    """
+    Crée un DataFrame d'erreurs depuis un DataFrame source
+    Utilisé pour logger les erreurs ligne par ligne
+    """
+    if "line_id" not in df.columns:
+        df = df.withColumn("line_id", F.row_number().over(Window.orderBy(F.monotonically_increasing_id())))
+    
+    return df.select(
+        F.lit(table_name).alias("table_name"),
+        F.lit(filename).alias("filename"),
+        F.col("line_id"),
+        F.lit(column_name).alias("column_name"),
+        F.lit(error_message).alias("error_message"),
+        F.col(raw_value_col).cast("string").alias("raw_value") if raw_value_col else F.lit(None).cast("string").alias("raw_value"),
+        F.lit(1).alias("error_count")
+    ).limit(1000)
+```
+
+### **Puis utilisez ces fonctions dans la validation des types :**
+
+```python
+# Dans la boucle de validation des types, remplacez :
+
+# ❌ Ancien code
+err = invalid_rows.limit(1000).select(
+    F.lit(source_table).alias("table_name"),
+    F.lit(filename_for_log).alias("filename"),
+    ...
+)
+
+# ✅ Nouveau code
+err = create_error_dataframe_from_rows(
+    df=invalid_rows,
+    table_name=source_table,
+    filename=filename_for_log,
+    column_name=cname,
+    error_message=f"TYPE MISMATCH: Expected {expected_type}, found invalid value",
+    raw_value_col=f"{cname}_original"
+)
+```
+
+## 🚀 **Fix rapide pour débloquer immédiatement**
+
+Si vous voulez juste débloquer rapidement sans refactorer, remplacez l'affichage par un simple `show()` au lieu de `display()` :
+
+```python
+print("\n📊 Aperçu des erreurs détectées (max 100) :")
+if not df_err_global.rdd.isEmpty():
+    # Dédupliquer les colonnes d'abord
+    df_err_global = deduplicate_columns(df_err_global)
+    
+    # Afficher avec show() au lieu de display()
+    df_err_global.select(
+        F.coalesce(F.col("column_name"), F.lit("N/A")).alias("column_name"),
+        F.coalesce(F.col("error_message"), F.lit("Unknown error")).alias("error_message"),
+        F.coalesce(F.col("error_count"), F.lit(1)).alias("error_count")
+    ).groupBy("column_name", "error_message").agg(
+        F.sum("error_count").alias("total_count")
+    ).orderBy(F.desc("total_count")).show(100, truncate=False)
+else:
+    print("✅ Aucune erreur détectée")
+```
+
+## 📊 **Diagnostic : Voir le schéma actuel**
+
+Pour comprendre exactement quel est le problème de schéma, ajoutez ceci AVANT l'affichage :
+
+```python
+print("\n🔍 Diagnostic du DataFrame d'erreurs :")
+print(f"Nombre de lignes : {df_err_global.count() if df_err_global else 0}")
+print(f"Colonnes présentes : {df_err_global.columns if df_err_global else 'None'}")
+if df_err_global:
+    print("\nSchéma :")
+    df_err_global.printSchema()
+    
+    print("\nExemple de données (3 premières lignes) :")
+    for row in df_err_global.take(3):
+        print(row)
+```
+
+Utilisez une de ces solutions et dites-moi ce que vous obtenez ! Je pourrai alors affiner la correction si nécessaire. 🎯
