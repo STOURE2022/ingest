@@ -1,0 +1,171 @@
+Je vois ! L'erreur persiste toujours : `[DELTA_FAILED_TO_MERGE_FIELDS] Failed to merge fields 'line_id' and 'line_id'`
+
+Le problème vient de la fonction `write_quality_errors()`. Quand on essaie d'écrire dans une table Delta existante qui a déjà une colonne `line_id`, et que notre DataFrame a aussi `line_id`, il y a un conflit.
+
+## 🔧 **Solution définitive : Corriger `write_quality_errors()`**
+
+Le problème est à la **ligne 288** dans la fonction `write_quality_errors()`. Il faut **supprimer `line_id`** avant d'écrire dans Delta.
+
+### **Remplacez TOUTE la fonction `write_quality_errors()` par cette version corrigée :**
+
+```python
+def write_quality_errors(df_errors: DataFrame, table_name: str, zone: str = "internal",
+                         base_path: str = None, env: str = None):
+    """Enregistre erreurs qualité"""
+    if base_path is None:
+        base_path = PARAMS["log_quality_path"]
+    if env is None:
+        env = PARAMS["env"]
+    
+    if df_errors is None or df_errors.rdd.isEmpty():
+        return
+    
+    today = datetime.today()
+    
+    # ✅ CORRECTION 1 : Dédupliquer colonnes
+    df_errors = deduplicate_columns(df_errors)
+    
+    # ✅ CORRECTION 2 : Supprimer line_id AVANT d'ajouter métadonnées
+    # (pour éviter conflit avec line_id de la table Delta existante)
+    if "line_id" in df_errors.columns:
+        df_errors = df_errors.drop("line_id")
+    
+    # Normaliser raw_value
+    if "raw_value" in df_errors.columns:
+        df_errors = df_errors.withColumn("raw_value", F.col("raw_value").cast("string"))
+    else:
+        df_errors = df_errors.withColumn("raw_value", F.lit(None).cast("string"))
+    
+    # Ajouter métadonnées
+    df_log = (
+        df_errors
+        .withColumn("table_name", F.coalesce(F.col("table_name"), F.lit(table_name)))
+        .withColumn("Zone", F.lit(zone))
+        .withColumn("Env", F.lit(env))
+        .withColumn("log_ts", F.lit(datetime.now()))
+        .withColumn("yyyy", F.lit(today.year))
+        .withColumn("mm", F.lit(today.month))
+        .withColumn("dd", F.lit(today.day))
+    )
+    
+    # ✅ CORRECTION 3 : Dédupliquer à nouveau après ajout métadonnées
+    df_log = deduplicate_columns(df_log)
+    
+    # Créer répertoire si nécessaire
+    try:
+        dbutils.fs.ls(base_path)
+    except Exception:
+        dbutils.fs.mkdirs(base_path)
+    
+    # Vérifier si table Delta existe
+    try:
+        spark.read.format("delta").load(base_path)
+        table_exists = True
+    except Exception:
+        table_exists = False
+    
+    if not table_exists:
+        # Créer la table pour la première fois
+        df_log.write.format("delta").mode("overwrite") \
+            .partitionBy("yyyy", "mm", "dd").save(base_path)
+        print(f"✅ Table Delta créée : {base_path}")
+    else:
+        # ✅ CORRECTION 4 : Append avec mergeSchema désactivé (évite conflits)
+        df_log.write.format("delta").mode("append") \
+            .option("mergeSchema", "false") \
+            .save(base_path)
+```
+
+## 🎯 **Explication du problème**
+
+Le problème se produisait ainsi :
+
+1. **Première écriture** : La table Delta `wax_data_quality_errors` est créée avec une colonne `line_id`
+2. **Deuxième écriture** : Votre DataFrame `df_err_global` contient aussi `line_id`
+3. **Spark essaie de merger** : Il voit deux colonnes `line_id` (une dans la table, une dans le DataFrame) → **ERREUR**
+
+La solution est de **supprimer `line_id`** du DataFrame avant d'écrire, car :
+- `line_id` n'est utile QUE pendant le traitement (pour référencer les lignes dans le fichier source)
+- Une fois dans la table Delta de logs, on n'en a plus besoin
+- Les logs sont déjà identifiables par `table_name`, `filename`, `column_name`, `error_message`
+
+## ✅ **Alternative : Garder line_id mais le renommer**
+
+Si vous voulez absolument garder `line_id` dans vos logs qualité, utilisez cette version à la place :
+
+```python
+def write_quality_errors(df_errors: DataFrame, table_name: str, zone: str = "internal",
+                         base_path: str = None, env: str = None):
+    """Enregistre erreurs qualité"""
+    if base_path is None:
+        base_path = PARAMS["log_quality_path"]
+    if env is None:
+        env = PARAMS["env"]
+    
+    if df_errors is None or df_errors.rdd.isEmpty():
+        return
+    
+    today = datetime.today()
+    df_errors = deduplicate_columns(df_errors)
+    
+    # ✅ Renommer line_id en source_line_id
+    if "line_id" in df_errors.columns:
+        df_errors = df_errors.withColumnRenamed("line_id", "source_line_id")
+    
+    if "raw_value" in df_errors.columns:
+        df_errors = df_errors.withColumn("raw_value", F.col("raw_value").cast("string"))
+    else:
+        df_errors = df_errors.withColumn("raw_value", F.lit(None).cast("string"))
+    
+    df_log = (
+        df_errors
+        .withColumn("table_name", F.coalesce(F.col("table_name"), F.lit(table_name)))
+        .withColumn("Zone", F.lit(zone))
+        .withColumn("Env", F.lit(env))
+        .withColumn("log_ts", F.lit(datetime.now()))
+        .withColumn("yyyy", F.lit(today.year))
+        .withColumn("mm", F.lit(today.month))
+        .withColumn("dd", F.lit(today.day))
+    )
+    
+    df_log = deduplicate_columns(df_log)
+    
+    try:
+        dbutils.fs.ls(base_path)
+    except Exception:
+        dbutils.fs.mkdirs(base_path)
+    
+    try:
+        spark.read.format("delta").load(base_path)
+        table_exists = True
+    except Exception:
+        table_exists = False
+    
+    if not table_exists:
+        df_log.write.format("delta").mode("overwrite") \
+            .partitionBy("yyyy", "mm", "dd").save(base_path)
+        print(f"✅ Table Delta créée : {base_path}")
+    else:
+        df_log.write.format("delta").mode("append") \
+            .option("mergeSchema", "true") \
+            .save(base_path)
+```
+
+## 🧪 **Test rapide**
+
+Après avoir appliqué la correction, **supprimez la table Delta de logs** pour repartir à zéro :
+
+```python
+# Exécutez cette cellule AVANT de relancer le pipeline
+try:
+    dbutils.fs.rm(PARAMS["log_quality_path"], True)
+    print("✅ Table de logs qualité supprimée")
+except Exception as e:
+    print(f"⚠️ {e}")
+```
+
+Puis relancez votre pipeline. L'erreur `DELTA_FAILED_TO_MERGE_FIELDS` devrait disparaître ! 🎉
+
+Quelle version préférez-vous :
+1. **Supprimer `line_id`** (recommandé, plus simple)
+2. **Renommer en `source_line_id`** (garde l'info mais plus complexe)
