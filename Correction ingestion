@@ -1,0 +1,161 @@
+"""
+ingestion.py
+-------------
+Implémentation des modes d’ingestion WAX (compatible local & Databricks).
+- FULL_SNAPSHOT
+- DELTA_FROM_FLOW
+- DELTA_FROM_NON_HISTORIZED
+- DELTA_FROM_HISTORIZED
+- FULL_KEY_REPLACE
+- Fallback (append)
+"""
+
+import os
+from datetime import datetime
+import pyspark.sql.functions as F
+from pyspark.sql import DataFrame
+from delta.tables import DeltaTable
+from delta_manager import save_delta_table, merge_delta_table, register_table_in_metastore
+
+
+# ==============================================================
+# 1️⃣ OUTILS GÉNÉRIQUES
+# ==============================================================
+
+def is_databricks():
+    """Retourne True si le code tourne sur Databricks."""
+    return "DATABRICKS_RUNTIME_VERSION" in os.environ
+
+
+def build_output_path(env: str, zone: str, table_name: str, version: str, parts: dict = None):
+    """
+    Construit le chemin de sortie Delta ou Parquet selon l'environnement.
+    """
+    if zone.startswith("dbfs:") or zone.startswith("/mnt"):
+        return f"{zone}/{env}/{version}/{table_name}"
+    else:
+        base_dir = os.path.join(os.getcwd(), "data", "output", env, version, zone)
+        os.makedirs(base_dir, exist_ok=True)
+        return os.path.join(base_dir, table_name)
+
+
+# ==============================================================
+# 2️⃣ FONCTION PRINCIPALE D’INGESTION
+# ==============================================================
+
+def apply_ingestion_mode(
+    spark,
+    df_raw: DataFrame,
+    column_defs,
+    table_name: str,
+    ingestion_mode: str,
+    env: str,
+    zone: str,
+    version: str,
+    parts: dict,
+    FILE_NAME_RECEIVED: str,
+):
+    """
+    Applique le mode d’ingestion selon la configuration Excel.
+    Compatible Databricks et exécution locale.
+    """
+
+    parts = parts or {}
+    path_all = build_output_path(env, zone, f"{table_name}_all", version, parts)
+    path_last = build_output_path(env, zone, f"{table_name}_last", version, parts)
+
+    specials = column_defs.copy()
+    specials["Is Special lower"] = specials["Is Special"].astype(str).str.lower()
+    merge_keys = specials[specials["Is Special lower"] == "ismergekey"]["Column Name"].tolist()
+    update_cols = specials[specials["Is Special lower"] == "isstartvalidity"]["Column Name"].tolist()
+    update_col = update_cols[0] if update_cols else None
+
+    imode = (ingestion_mode or "").strip().upper()
+    print(f"\n🧩 Ingestion mode : {imode} | Table : {table_name}")
+
+    # ==========================================================
+    # 1️⃣ Sauvegarde complète (_all)
+    # ==========================================================
+    save_delta_table(
+        spark,
+        df_raw,
+        params={"base_output_path": os.path.dirname(path_all)},
+        table_name=os.path.basename(path_all),
+        mode="append",
+        partition_cols=["yyyy", "mm", "dd"],
+    )
+    register_table_in_metastore(spark, path_all, {"env": env}, f"{table_name}_all", if_exists="ignore")
+
+    # ==========================================================
+    # 2️⃣ Modes spécifiques
+    # ==========================================================
+    if imode == "FULL_SNAPSHOT":
+        save_delta_table(
+            spark,
+            df_raw,
+            params={"base_output_path": os.path.dirname(path_last)},
+            table_name=os.path.basename(path_last),
+            mode="overwrite",
+            partition_cols=["yyyy", "mm", "dd"],
+        )
+        register_table_in_metastore(spark, path_last, {"env": env}, f"{table_name}_last", if_exists="overwrite")
+
+    elif imode == "DELTA_FROM_FLOW":
+        save_delta_table(
+            spark,
+            df_raw,
+            params={"base_output_path": os.path.dirname(path_last)},
+            table_name=os.path.basename(path_last),
+            mode="append",
+            partition_cols=["yyyy", "mm", "dd"],
+        )
+        register_table_in_metastore(spark, path_last, {"env": env}, f"{table_name}_last", if_exists="append")
+
+    elif imode == "DELTA_FROM_NON_HISTORIZED":
+        if not merge_keys:
+            print("⚠️ Aucun merge_key défini — fallback overwrite.")
+            save_delta_table(
+                spark,
+                df_raw,
+                params={"base_output_path": os.path.dirname(path_last)},
+                table_name=os.path.basename(path_last),
+                mode="overwrite",
+                partition_cols=["yyyy", "mm", "dd"],
+            )
+            register_table_in_metastore(spark, path_last, {"env": env}, f"{table_name}_last", if_exists="overwrite")
+            return
+
+        print(f"🕒 MERGE sur {merge_keys} ...")
+        merge_delta_table(spark, df_raw, path_last, merge_keys)
+        register_table_in_metastore(spark, path_last, {"env": env}, f"{table_name}_last", if_exists="append")
+
+    elif imode == "DELTA_FROM_HISTORIZED":
+        save_delta_table(
+            spark,
+            df_raw,
+            params={"base_output_path": os.path.dirname(path_last)},
+            table_name=os.path.basename(path_last),
+            mode="append",
+            partition_cols=["yyyy", "mm", "dd"],
+        )
+        register_table_in_metastore(spark, path_last, {"env": env}, f"{table_name}_last", if_exists="append")
+
+    elif imode == "FULL_KEY_REPLACE":
+        if not merge_keys:
+            raise Exception(f"❌ Mode FULL_KEY_REPLACE : merge_keys manquantes pour {table_name}.")
+        merge_delta_table(spark, df_raw, path_last, merge_keys)
+        register_table_in_metastore(spark, path_last, {"env": env}, f"{table_name}_last", if_exists="append")
+
+    else:
+        print(f"❌ Mode inconnu {imode} — fallback append.")
+        save_delta_table(
+            spark,
+            df_raw,
+            params={"base_output_path": os.path.dirname(path_last)},
+            table_name=os.path.basename(path_last),
+            mode="append",
+            partition_cols=["yyyy", "mm", "dd"],
+        )
+        register_table_in_metastore(spark, path_last, {"env": env}, f"{table_name}_last", if_exists="append")
+
+    print(f"✅ Ingestion terminée pour {table_name} ({imode})")
