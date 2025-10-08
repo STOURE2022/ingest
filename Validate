@@ -1,0 +1,117 @@
+def validate_filename(fname: str, source_table: str, matched_uri: str, log_quality_path: str) -> bool:
+    """
+    Valide qu'un nom de fichier contient une date valide
+    Rejette les fichiers avec des dates impossibles (ex: mois 13, jour 32, etc.)
+    Retourne True si OK, False si erreur
+    """
+    base = os.path.basename(fname)
+    print(f"🔍 Validation fichier : {base}")
+    
+    error_schema = StructType([
+        StructField("table_name", StringType(), True),
+        StructField("filename", StringType(), True),
+        StructField("column_name", StringType(), True),
+        StructField("line_id", IntegerType(), True),
+        StructField("invalid_value", StringType(), True),
+        StructField("error_message", StringType(), True),
+        StructField("uri", StringType(), True),
+    ])
+    
+    # 1. Extraction des parties de date
+    parts = extract_parts_from_filename(base)
+    if not parts:
+        print(f"❌ Fichier rejeté : {base} (pattern de date manquant)")
+        err_data = [(source_table, base, "filename", None, None,
+                     "Missing date pattern in filename", matched_uri)]
+        err_df = spark.createDataFrame(err_data, error_schema)
+        
+        # Créer le chemin si nécessaire
+        try:
+            dbutils.fs.ls(log_quality_path)
+        except Exception:
+            dbutils.fs.mkdirs(log_quality_path)
+        
+        err_df.write.format("delta").mode("append").save(log_quality_path)
+        return False
+    
+    # 2. Validation de la date réelle
+    try:
+        yyyy = parts.get("yyyy")
+        mm = parts.get("mm")
+        dd = parts.get("dd", 1)
+        
+        if not yyyy or not mm:
+            raise ValueError("Missing year or month")
+        
+        # Validation des plages
+        if not (1900 <= yyyy <= 2100):
+            raise ValueError(f"Year {yyyy} out of range (1900-2100)")
+        
+        if not (1 <= mm <= 12):
+            raise ValueError(f"Month {mm} invalid (must be 1-12)")
+        
+        if not (1 <= dd <= 31):
+            raise ValueError(f"Day {dd} invalid (must be 1-31)")
+        
+        # Validation avec datetime (détecte 31 février, 30 février, etc.)
+        date_obj = datetime(yyyy, mm, dd)
+        
+        print(f"✅ Fichier accepté : {base} (date valide: {yyyy}-{mm:02d}-{dd:02d})")
+        return True
+        
+    except (ValueError, TypeError) as e:
+        error_msg = str(e)
+        print(f"❌ Fichier rejeté : {base} (date invalide: {error_msg})")
+        
+        date_str = f"{yyyy}-{mm:02d}-{dd:02d}" if yyyy and mm else "N/A"
+        err_data = [(source_table, base, "filename", None, date_str,
+                     f"Invalid date in filename: {error_msg}", matched_uri)]
+        err_df = spark.createDataFrame(err_data, error_schema)
+        
+        # Créer le chemin si nécessaire
+        try:
+            dbutils.fs.ls(log_quality_path)
+        except Exception:
+            dbutils.fs.mkdirs(log_quality_path)
+        
+        err_df.write.format("delta").mode("append").save(log_quality_path)
+        return False
+Et améliorez aussi la fonction extract_parts_from_filename() :
+def extract_parts_from_filename(fname: str) -> dict:
+    """
+    Extrait yyyy/mm/dd depuis le nom de fichier
+    Exemple: 'site_20250904_120001.csv' -> {'yyyy': 2025, 'mm': 9, 'dd': 4}
+    
+    Gère plusieurs formats :
+    - YYYYMMDD (20250904)
+    - YYYY-MM-DD (2025-09-04)
+    - YYYY_MM_DD (2025_09_04)
+    - DDMMYYYY (04092025)
+    """
+    base = os.path.basename(fname)
+    
+    # Pattern 1 : YYYYMMDD ou YYYY-MM-DD ou YYYY_MM_DD
+    m = re.search(r"(?P<yyyy>\d{4})[-_]?(?P<mm>\d{2})[-_]?(?P<dd>\d{2})", base)
+    if m:
+        parts = {}
+        if m.group("yyyy"):
+            parts["yyyy"] = int(m.group("yyyy"))
+        if m.group("mm"):
+            parts["mm"] = int(m.group("mm"))
+        if m.group("dd"):
+            parts["dd"] = int(m.group("dd"))
+        return parts
+    
+    # Pattern 2 : DDMMYYYY (format européen)
+    m2 = re.search(r"(?P<dd>\d{2})[-_]?(?P<mm>\d{2})[-_]?(?P<yyyy>\d{4})", base)
+    if m2:
+        parts = {}
+        if m2.group("yyyy"):
+            parts["yyyy"] = int(m2.group("yyyy"))
+        if m2.group("mm"):
+            parts["mm"] = int(m2.group("mm"))
+        if m2.group("dd"):
+            parts["dd"] = int(m2.group("dd"))
+        return parts
+    
+    return {}
