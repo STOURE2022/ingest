@@ -1,0 +1,35 @@
+def build_regex_pattern(filename_pattern: str) -> tuple:
+    """
+    Construit les patterns regex depuis le pattern Excel
+    Exemple: site_<yyyy><mm><dd>_<hhmmss>.csv -> site_20250904_120001.csv
+    """
+    import re
+    
+    # Remplacements des placeholders
+    replacements = [
+        ("<yyyy>", r"\d{4}"),
+        ("<mm>", r"\d{2}"),
+        ("<dd>", r"\d{2}"),
+        ("<hhmmss>", r"\d{6}")
+    ]
+    
+    # Pattern avec timestamp
+    rx_with_time = filename_pattern
+    for placeholder, regex in replacements:
+        rx_with_time = rx_with_time.replace(placeholder, regex)
+    
+    # Échapper le point pour qu'il corresponde au littéral "."
+    rx_with_time = rx_with_time.replace(".", r"\.")
+    rx_with_time = f"^{rx_with_time}$"
+    
+    # Pattern sans timestamp
+    rx_without_time = filename_pattern
+    for placeholder, regex in replacements[:-1]:  # Tous sauf <hhmmss>
+        rx_without_time = rx_without_time.replace(placeholder, regex)
+    
+    # Supprimer les références au timestamp
+    rx_without_time = rx_without_time.replace("_<hhmmss>", "").replace("<hhmmss>", "")
+    rx_without_time = rx_without_time.replace(".", r"\.")
+    rx_without_time = f"^{rx_without_time}$"
+    
+    return rx_with_time, rx_without_time
