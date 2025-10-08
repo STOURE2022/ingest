@@ -1,0 +1,763 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # 🚀 WAX Data Ingestion Pipeline - Version Optimisée
+# MAGIC 
+# MAGIC **Améliorations principales :**
+# MAGIC - ✅ Performance : Agrégations Spark-side, pas de collect() massif
+# MAGIC - ✅ Qualité : Fonctions utilitaires réutilisables
+# MAGIC - ✅ Robustesse : Meilleure gestion d'erreurs et validations
+# MAGIC - ✅ Maintenabilité : Code DRY (Don't Repeat Yourself)
+# MAGIC - ✅ Observabilité : Logs structurés et métriques détaillées
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 📋 Configuration des Widgets
+
+# COMMAND ----------
+
+# =========================================================
+# Création des widgets
+# =========================================================
+
+dbutils.widgets.text("zip_path", "dbfs:/FileStore/tables/wax_delta_from_historized.zip", "📦 ZIP Source")
+dbutils.widgets.text("excel_path", "dbfs:/FileStore/tables/custom_test2_secret_conf.xlsx", "📑 Excel Config")
+dbutils.widgets.text("extract_dir", "dbfs:/tmp/unzipped_wax_csvs", "📂 Dossier Extraction ZIP")
+dbutils.widgets.text("log_exec_path", "/mnt/logs/wax_execution_logs_delta", "📝 Logs Exécution (Delta)")
+dbutils.widgets.text("log_quality_path", "/mnt/logs/wax_data_quality_errors_delta", "🚦 Log Qualité (Delta)")
+dbutils.widgets.text("env", "dev", "🌍 Environnement")
+dbutils.widgets.text("version", "v1", "⚙️ Version Pipeline")
+
+# Lecture de nos widgets
+PARAMS = {k: dbutils.widgets.get(k) for k in [
+    "zip_path", "excel_path", "extract_dir",
+    "log_exec_path", "log_quality_path", "env", "version"
+]}
+
+print("✅ Paramètres chargés :")
+for k, v in PARAMS.items():
+    print(f"  {k}: {v}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 📚 Imports et Configuration
+
+# COMMAND ----------
+
+# =========================================================
+# Imports
+# =========================================================
+
+import os, re, zipfile, subprocess, sys, time
+from datetime import datetime
+from collections import Counter
+from functools import reduce
+
+import pandas as pd
+
+from pyspark.sql import SparkSession, DataFrame, Window, Row
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+from pyspark.sql.types import (
+    StructType, StructField, StringType, IntegerType, DoubleType, 
+    BooleanType, DateType, TimestampType, LongType, FloatType, DecimalType
+)
+
+from delta.tables import DeltaTable
+from py4j.protocol import Py4JJavaError
+
+# Installation openpyxl si nécessaire
+try:
+    import openpyxl
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl", "--quiet"])
+    import openpyxl
+
+print("✅ Imports terminés")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 🛠️ Fonctions Utilitaires Génériques
+
+# COMMAND ----------
+
+# =========================================================
+# Fonctions utilitaires de base
+# =========================================================
+
+def parse_bool(x, default=False):
+    """Parse une valeur en booléen avec support de multiples formats"""
+    if x is None:
+        return default
+    s = str(x).strip().lower()
+    if s in ["true", "1", "yes", "y", "oui"]:
+        return True
+    if s in ["false", "0", "no", "n", "non"]:
+        return False
+    return default
+
+
+def normalize_delimiter(raw) -> str:
+    """Normalise le délimiteur (doit être un seul caractère)"""
+    if raw is None or str(raw).strip() == "":
+        return ","
+    s = str(raw).strip()
+    if len(s) == 1:
+        return s
+    raise ValueError(f"Délimiteur '{raw}' invalide (doit être 1 caractère)")
+
+
+def parse_header_mode(x) -> tuple:
+    """Parse le mode header: (use_header: bool, first_line_only: bool)"""
+    if x is None:
+        return False, False
+    s = str(x).strip().upper()
+    if s == "HEADER USE":
+        return True, True
+    if s == "FIRST LINE":
+        return True, False
+    return False, False
+
+
+def parse_tolerance(raw, total_rows: int, default=0.0) -> float:
+    """
+    Parse la tolérance d'erreur (pourcentage ou valeur absolue)
+    Exemple: "10%", "0.5%", "100" (absolu)
+    """
+    if raw is None or str(raw).strip().lower() in ["", "nan", "n/a", "none"]:
+        return default
+
+    s = str(raw).strip().lower().replace(",", ".").replace("%", "").replace(" ", "")
+    
+    # Extraction numérique
+    m = re.search(r"^(\d+(?:\.\d+)?)%?$", s)
+    if not m:
+        return default
+    
+    val = float(m.group(1))
+    
+    # Si pourcentage détecté dans la chaîne originale
+    if "%" in str(raw):
+        return val / 100.0
+    
+    # Sinon, valeur absolue convertie en ratio
+    if total_rows <= 0:
+        return 0.0
+    return val / total_rows
+
+
+def deduplicate_columns(df: DataFrame) -> DataFrame:
+    """Supprime les colonnes dupliquées (case-insensitive)"""
+    seen, cols = set(), []
+    for c in df.columns:
+        c_lower = c.lower()
+        if c_lower not in seen:
+            cols.append(c)
+            seen.add(c_lower)
+    return df.select(*cols)
+
+
+def safe_count(df: DataFrame) -> int:
+    """Count sécurisé qui gère les DataFrames vides"""
+    try:
+        return df.count()
+    except Exception:
+        return 0
+
+print("✅ Fonctions utilitaires chargées")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 📊 Gestion des Types Spark
+
+# COMMAND ----------
+
+# =========================================================
+# Mapping des types
+# =========================================================
+
+TYPE_MAPPING = {
+    "STRING": StringType(),
+    "INTEGER": IntegerType(),
+    "INT": IntegerType(),
+    "LONG": LongType(),
+    "FLOAT": FloatType(),
+    "DOUBLE": DoubleType(),
+    "BOOLEAN": BooleanType(),
+    "DATE": DateType(),
+    "TIMESTAMP": TimestampType()
+}
+
+
+def spark_type_from_config(row):
+    """Convertit une définition Excel en type Spark"""
+    t = str(row.get("Field type", "STRING")).strip().upper()
+    
+    if t in TYPE_MAPPING:
+        return TYPE_MAPPING[t]
+    
+    if t == "DECIMAL":
+        prec = int(row.get("Decimal precision", 38) or 38)
+        scale = int(row.get("Decimal scale", 18) or 18)
+        return DecimalType(prec, scale)
+    
+    return StringType()
+
+
+def build_schema_from_config(column_defs: pd.DataFrame) -> StructType:
+    """Construit un StructType Spark à partir des définitions Excel"""
+    fields = []
+    for _, row in column_defs.iterrows():
+        field_name = row["Column Name"]
+        field_type = spark_type_from_config(row)
+        is_nullable = parse_bool(row.get("Is Nullable", True), True)
+        fields.append(StructField(field_name, field_type, is_nullable))
+    
+    return StructType(fields)
+
+print("✅ Gestion des types configurée")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 📝 Système de Logging
+
+# COMMAND ----------
+
+# =========================================================
+# Logs d'exécution
+# =========================================================
+
+def log_execution(
+    table_name: str,
+    filename: str,
+    input_format: str,
+    ingestion_mode: str,
+    output_zone: str,
+    row_count: int = 0,
+    column_count: int = 0,
+    masking_applied: bool = False,
+    error_count: int = 0,
+    error_msg: str = None,
+    status: str = "SUCCESS",
+    start_time: float = None,
+    env: str = None,
+    log_path: str = None
+):
+    """Enregistre un log d'exécution dans Delta Lake"""
+    
+    if env is None:
+        env = PARAMS["env"]
+    if log_path is None:
+        log_path = PARAMS["log_exec_path"]
+    
+    today = datetime.today()
+    duration = round(time.time() - start_time, 2) if start_time else None
+    
+    schema = StructType([
+        StructField("table_name", StringType(), True),
+        StructField("filename", StringType(), True),
+        StructField("input_format", StringType(), True),
+        StructField("ingestion_mode", StringType(), True),
+        StructField("output_zone", StringType(), True),
+        StructField("row_count", IntegerType(), True),
+        StructField("column_count", IntegerType(), True),
+        StructField("masking_applied", BooleanType(), True),
+        StructField("error_count", IntegerType(), True),
+        StructField("error_message", StringType(), True),
+        StructField("status", StringType(), True),
+        StructField("duration", DoubleType(), True),
+        StructField("env", StringType(), True),
+        StructField("log_ts", TimestampType(), True),
+        StructField("yyyy", IntegerType(), True),
+        StructField("mm", IntegerType(), True),
+        StructField("dd", IntegerType(), True)
+    ])
+    
+    row = [(
+        str(table_name), str(filename), str(input_format), str(ingestion_mode),
+        str(output_zone), int(row_count or 0), int(column_count or 0), bool(masking_applied),
+        int(error_count or 0), str(error_msg or ""), str(status),
+        float(duration or 0), str(env), datetime.now(),
+        today.year, today.month, today.day
+    )]
+    
+    df_log = spark.createDataFrame(row, schema=schema)
+    
+    # Création du répertoire si nécessaire
+    try:
+        dbutils.fs.ls(log_path)
+    except Exception:
+        dbutils.fs.mkdirs(log_path)
+    
+    # Écriture
+    df_log.write.format("delta") \
+        .mode("append") \
+        .option("mergeSchema", "true") \
+        .partitionBy("yyyy", "mm", "dd") \
+        .save(log_path)
+
+
+def write_quality_errors(
+    df_errors: DataFrame,
+    table_name: str,
+    zone: str = "internal",
+    base_path: str = None,
+    env: str = None
+):
+    """Enregistre les erreurs de qualité dans Delta Lake"""
+    
+    if base_path is None:
+        base_path = PARAMS["log_quality_path"]
+    if env is None:
+        env = PARAMS["env"]
+    
+    if df_errors is None or df_errors.rdd.isEmpty():
+        return
+    
+    today = datetime.today()
+    
+    # Dédupliquer les colonnes
+    df_errors = deduplicate_columns(df_errors)
+    
+    # Normaliser raw_value
+    if "raw_value" in df_errors.columns:
+        df_errors = df_errors.withColumn("raw_value", F.col("raw_value").cast("string"))
+    else:
+        df_errors = df_errors.withColumn("raw_value", F.lit(None).cast("string"))
+    
+    # Ajouter métadonnées
+    df_log = (
+        df_errors
+        .withColumn("table_name", F.coalesce(F.col("table_name"), F.lit(table_name)))
+        .withColumn("Zone", F.lit(zone))
+        .withColumn("Env", F.lit(env))
+        .withColumn("log_ts", F.lit(datetime.now()))
+        .withColumn("yyyy", F.lit(today.year))
+        .withColumn("mm", F.lit(today.month))
+        .withColumn("dd", F.lit(today.day))
+    )
+    
+    # Création du répertoire si nécessaire
+    try:
+        dbutils.fs.ls(base_path)
+    except Exception:
+        dbutils.fs.mkdirs(base_path)
+    
+    # Vérifier si la table Delta existe
+    try:
+        spark.read.format("delta").load(base_path)
+    except Exception:
+        # Créer la table si elle n'existe pas
+        df_log.write.format("delta") \
+            .mode("overwrite") \
+            .partitionBy("yyyy", "mm", "dd") \
+            .save(base_path)
+        print(f"✅ Table Delta créée : {base_path}")
+        return
+    
+    # Append à la table existante
+    df_log.write.format("delta") \
+        .mode("append") \
+        .option("mergeSchema", "true") \
+        .save(base_path)
+
+print("✅ Système de logging configuré")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 📁 Gestion des Fichiers et Patterns
+
+# COMMAND ----------
+
+# =========================================================
+# Extraction de métadonnées des fichiers
+# =========================================================
+
+def extract_parts_from_filename(fname: str) -> dict:
+    """
+    Extrait yyyy/mm/dd depuis le nom de fichier
+    Exemple: 'data_20250108_v2.csv' -> {'yyyy': 2025, 'mm': 1, 'dd': 8}
+    """
+    base = os.path.basename(fname)
+    
+    # Pattern avec séparateurs optionnels
+    m = re.search(r"(?P<yyyy>\d{4})[-_]?(?P<mm>\d{2})[-_]?(?P<dd>\d{2})?", base)
+    if not m:
+        return {}
+    
+    parts = {}
+    if m.group("yyyy"):
+        parts["yyyy"] = int(m.group("yyyy"))
+    if m.group("mm"):
+        parts["mm"] = int(m.group("mm"))
+    if m.group("dd"):
+        parts["dd"] = int(m.group("dd"))
+    
+    return parts
+
+
+def validate_filename(fname: str, source_table: str, matched_uri: str, log_quality_path: str) -> bool:
+    """
+    Valide qu'un nom de fichier contient une date valide
+    Retourne True si OK, False si erreur
+    """
+    base = os.path.basename(fname)
+    print(f"🔍 Validation fichier : {base}")
+    
+    error_schema = StructType([
+        StructField("table_name", StringType(), True),
+        StructField("filename", StringType(), True),
+        StructField("column_name", StringType(), True),
+        StructField("line_id", IntegerType(), True),
+        StructField("invalid_value", StringType(), True),
+        StructField("error_message", StringType(), True),
+        StructField("uri", StringType(), True),
+    ])
+    
+    # Extraction des parties de date
+    parts = extract_parts_from_filename(base)
+    if not parts:
+        print(f"❌ Fichier rejeté : {base} (pattern de date manquant)")
+        err_data = [(source_table, base, None, None, None,
+                     "Missing date pattern in filename", matched_uri)]
+        err_df = spark.createDataFrame(err_data, error_schema)
+        err_df.write.format("delta").mode("append").save(log_quality_path)
+        return False
+    
+    # Validation de la date
+    try:
+        yyyy = parts.get("yyyy")
+        mm = parts.get("mm")
+        dd = parts.get("dd", 1)
+        
+        if not yyyy or not mm:
+            raise ValueError("Missing year or month")
+        
+        datetime(yyyy, mm, dd)  # Validation
+        print(f"✅ Fichier accepté : {base} (date valide: {yyyy}-{mm:02d}-{dd:02d})")
+        return True
+        
+    except (ValueError, TypeError) as e:
+        print(f"❌ Fichier rejeté : {base} (date invalide: {e})")
+        err_data = [(source_table, base, "filename", None, f"{yyyy}-{mm:02d}-{dd:02d}",
+                     "Invalid date in filename", matched_uri)]
+        err_df = spark.createDataFrame(err_data, error_schema)
+        err_df.write.format("delta").mode("append").save(log_quality_path)
+        return False
+
+
+def build_regex_pattern(filename_pattern: str) -> tuple:
+    """
+    Construit les patterns regex depuis le pattern Excel
+    Retourne (pattern_with_time, pattern_without_time)
+    """
+    PATTERNS = {
+        r"\<yyyy\>": r"(\d{4})",
+        r"\<mm\>": r"(\d{2})",
+        r"\<dd\>": r"(\d{2})",
+        r"\<hhmmss\>": r"(\d{6})"
+    }
+    
+    rx = re.escape(filename_pattern)
+    
+    # Pattern avec timestamp
+    rx_with_time = rx
+    for placeholder, replacement in PATTERNS.items():
+        rx_with_time = rx_with_time.replace(placeholder, replacement)
+    rx_with_time = f"^{rx_with_time}$"
+    
+    # Pattern sans timestamp
+    rx_without_time = rx
+    for placeholder, replacement in PATTERNS.items():
+        if placeholder != r"\<hhmmss\>":
+            rx_without_time = rx_without_time.replace(placeholder, replacement)
+    rx_without_time = rx_without_time.replace(r"_\<hhmmss\>", "").replace(r"\<hhmmss\>", "")
+    rx_without_time = f"^{rx_without_time}$"
+    
+    return rx_with_time, rx_without_time
+
+print("✅ Gestion des fichiers configurée")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 💾 Sauvegarde Delta Lake
+
+# COMMAND ----------
+
+# =========================================================
+# Écriture Delta avec partitionnement
+# =========================================================
+
+def build_output_path(env: str, zone: str, table_name: str, version: str, parts: dict = None) -> str:
+    """Construit le chemin de sortie Delta Lake"""
+    return f"/mnt/wax/{env}/{zone}/{version}/{table_name}"
+
+
+def save_delta(
+    df: DataFrame,
+    path: str,
+    mode: str = "append",
+    add_ts: bool = False,
+    parts: dict = None,
+    file_name_received: str = None
+):
+    """
+    Sauvegarde un DataFrame en Delta Lake avec partitionnement yyyy/mm/dd
+    """
+    today = datetime.today()
+    y = int((parts or {}).get("yyyy", today.year))
+    m = int((parts or {}).get("mm", today.month))
+    d = int((parts or {}).get("dd", today.day))
+    
+    # Ajout timestamp de traitement
+    if add_ts:
+        df = df.withColumn("FILE_PROCESS_DATE", F.current_timestamp())
+    
+    # Ajout nom de fichier
+    if file_name_received:
+        base_name = os.path.splitext(os.path.basename(file_name_received))[0]
+        df = df.withColumn("FILE_NAME_RECEIVED", F.lit(base_name))
+    
+    # Réorganiser les colonnes (métadonnées en premier)
+    ordered_cols = []
+    for meta_col in ["FILE_NAME_RECEIVED", "FILE_PROCESS_DATE"]:
+        if meta_col in df.columns:
+            ordered_cols.append(meta_col)
+    
+    other_cols = [c for c in df.columns if c not in ordered_cols]
+    df = df.select(ordered_cols + other_cols)
+    
+    # Dédupliquer les colonnes
+    df = deduplicate_columns(df)
+    
+    # Déterminer types de partitions depuis table existante
+    if DeltaTable.isDeltaTable(spark, path):
+        schema = spark.read.format("delta").load(path).schema
+        type_map = {f.name: f.dataType.simpleString() for f in schema.fields}
+        yyyy_type = type_map.get("yyyy", "int")
+        mm_type = type_map.get("mm", "int")
+        dd_type = type_map.get("dd", "int")
+    else:
+        yyyy_type, mm_type, dd_type = "int", "int", "int"
+    
+    # Ajout colonnes de partition
+    df = (
+        df.withColumn("yyyy", F.lit(y).cast(yyyy_type))
+          .withColumn("mm", F.lit(m).cast(mm_type))
+          .withColumn("dd", F.lit(d).cast(dd_type))
+    )
+    
+    # Optimisation : repartitionner avant écriture pour gros volumes
+    row_count = df.count()
+    if row_count > 1_000_000:
+        num_partitions = max(1, row_count // 1_000_000)
+        df = df.repartition(num_partitions, "yyyy", "mm", "dd")
+    
+    # Écriture Delta
+    df.write.format("delta") \
+        .option("mergeSchema", "true") \
+        .mode(mode) \
+        .partitionBy("yyyy", "mm", "dd") \
+        .save(path)
+    
+    print(f"✅ Delta sauvegardé : {path} (mode={mode}, partition={y}-{m:02d}-{d:02d}, rows={row_count})")
+
+
+def register_table_in_metastore(
+    spark,
+    table_name: str,
+    path: str,
+    database: str = "wax_obs",
+    if_exists: str = "ignore"
+):
+    """
+    Enregistre une table Delta dans le metastore Hive
+    if_exists: "overwrite", "ignore", "errorexists", "append"
+    """
+    full_name = f"{database}.{table_name}"
+    exists = any(t.name == table_name for t in spark.catalog.listTables(database))
+    
+    if exists and if_exists == "ignore":
+        print(f"⚠️ Table {full_name} existe déjà -> ignorée")
+        return
+    elif exists and if_exists == "errorexists":
+        raise Exception(f"❌ Table {full_name} existe déjà")
+    elif exists and if_exists == "overwrite":
+        print(f"♻️ Table {full_name} existe -> DROP + CREATE")
+        spark.sql(f"DROP TABLE IF EXISTS {full_name}")
+    elif exists and if_exists == "append":
+        print(f"➕ Table {full_name} existe -> append (pas de modif metastore)")
+        return
+    
+    # Création
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {full_name}
+        USING DELTA
+        LOCATION '{path}'
+    """)
+    print(f"✅ Table {full_name} enregistrée sur {path}")
+
+print("✅ Sauvegarde Delta configurée")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 🔍 Validation de Qualité des Données
+
+# COMMAND ----------
+
+# =========================================================
+# Validation qualité
+# =========================================================
+
+def check_data_quality(
+    df: DataFrame,
+    table_name: str,
+    merge_keys: list,
+    filename: str = None,
+    column_defs: pd.DataFrame = None
+) -> DataFrame:
+    """
+    Vérifie la qualité des données (nulls, doublons, colonnes vides)
+    Retourne un DataFrame d'erreurs
+    """
+    # Ajout line_id si absent
+    if "line_id" not in df.columns:
+        df = df.withColumn("line_id", F.row_number().over(Window.orderBy(F.monotonically_increasing_id())))
+    
+    schema = StructType([
+        StructField("table_name", StringType(), True),
+        StructField("filename", StringType(), True),
+        StructField("line_id", IntegerType(), True),
+        StructField("column_name", StringType(), True),
+        StructField("error_message", StringType(), True),
+        StructField("error_count", IntegerType(), True)
+    ])
+    
+    errors_df = spark.createDataFrame([], schema)
+    
+    # Colonnes de données (hors métadonnées)
+    data_columns = [c for c in df.columns if c not in 
+                    ["line_id", "yyyy", "mm", "dd", "FILE_PROCESS_DATE", "FILE_NAME_RECEIVED"]]
+    
+    if not data_columns:
+        return errors_df
+    
+    # Vérifier si toutes les colonnes sont nulles
+    all_null = all(df.filter(F.col(c).isNotNull()).count() == 0 for c in data_columns)
+    if all_null:
+        return spark.createDataFrame(
+            [(table_name, filename, None, "ALL_COLUMNS", "FILE_EMPTY_OR_ALL_NULL", 1)],
+            schema
+        )
+    
+    # 1. Vérifier les clés nulles
+    for key in merge_keys or []:
+        if key in df.columns:
+            null_key_count = df.filter(F.col(key).isNull()).count()
+            if null_key_count > 0:
+                errs = spark.createDataFrame(
+                    [(table_name, filename, None, key, "NULL_KEY", null_key_count)],
+                    schema
+                )
+                errors_df = errors_df.unionByName(errs, allowMissingColumns=True)
+    
+    # 2. Vérifier les doublons sur clés
+    if merge_keys:
+        valid_keys = [k for k in merge_keys if k in df.columns]
+        if valid_keys:
+            dup_df = (
+                df.groupBy(*valid_keys).count()
+                  .filter(F.col("count") > 1)
+                  .select(
+                      F.lit(table_name).alias("table_name"),
+                      F.lit(filename).alias("filename"),
+                      F.lit(None).cast("int").alias("line_id"),
+                      F.lit(','.join(valid_keys)).alias("column_name"),
+                      F.lit("DUPLICATE_KEY").alias("error_message"),
+                      F.col("count").alias("error_count")
+                  )
+            )
+            errors_df = errors_df.unionByName(dup_df, allowMissingColumns=True)
+    
+    # 3. Vérifier nullabilité par colonne
+    if column_defs is not None:
+        subset = column_defs[column_defs["Delta Table Name"] == table_name]
+        total_rows = df.count()
+        
+        for idx, crow in subset.iterrows():
+            cname = crow["Column Name"]
+            is_nullable = parse_bool(crow.get("Is Nullable", "true"), True)
+            
+            if cname not in df.columns:
+                continue
+            
+            non_null_count = df.filter(F.col(cname).isNotNull()).count()
+            
+            # Colonne entièrement nulle + non nullable
+            if non_null_count == 0 and not is_nullable:
+                errs = spark.createDataFrame(
+                    [(table_name, filename, None, cname, "COLUMN_ALL_NULL", total_rows)],
+                    schema
+                )
+                errors_df = errors_df.unionByName(errs, allowMissingColumns=True)
+            
+            # Valeurs nulles partielles + non nullable
+            elif non_null_count > 0 and not is_nullable:
+                null_count = df.filter(F.col(cname).isNull()).count()
+                if null_count > 0:
+                    # ⚠️ OPTIMISATION : Agrégation Spark-side, limite à 1000 erreurs
+                    null_sample = (
+                        df.filter(F.col(cname).isNull())
+                          .select(
+                              F.lit(table_name).alias("table_name"),
+                              F.lit(filename).alias("filename"),
+                              F.col("line_id"),
+                              F.lit(cname).alias("column_name"),
+                              F.lit("NULL_VALUE").alias("error_message"),
+                              F.lit(1).alias("error_count")
+                          )
+                          .limit(1000)  # Limite pour éviter collect massif
+                    )
+                    errors_df = errors_df.unionByName(null_sample, allowMissingColumns=True)
+    
+    return errors_df
+
+
+def parse_date_with_logs(
+    df: DataFrame,
+    cname: str,
+    patterns: list,
+    table_name: str,
+    filename: str,
+    default_date=None
+) -> tuple:
+    """
+    Parse une colonne date avec multiples patterns
+    Retourne (df_parsed, df_errors)
+    """
+    raw_col = F.col(cname)
+    
+    # Vides -> None
+    col_expr = F.when(F.length(F.trim(raw_col)) == 0, F.lit(None)).otherwise(raw_col)
+    
+    # Essayer tous les patterns
+    ts_col = None
+    for p in patterns:
+        cand = F.expr(f"try_to_timestamp({cname}, '{p}')")
+        ts_col = cand if ts_col is None else F.coalesce(ts_col, cand)
+    
+    parsed = F.to_date(ts_col)
+    parsed_with_default = F.when(parsed.isNull(), F.lit(default_date)).otherwise(parsed)
+    
+    # Remplacer la colonne
+    df_parsed = df.withColumn(cname, parsed_with_default)
+    
+    # Logs d'erreurs (agrégation Spark-side)
+    
