@@ -1,0 +1,110 @@
+# =====================================================================
+# VALIDATION DE TYPES (cast sécurisé final) - VERSION SANS DOUBLONS
+# =====================================================================
+
+print(f"🔧 Validation types de colonnes...")
+column_errors = {}
+
+for _, col_def in file_columns_df[file_columns_df["Delta Table Name"] == source_table].iterrows():
+    cname = str(col_def.get("Column Name")).strip()
+    expected_type = str(col_def.get("Field type")).strip().upper()
+    is_nullable = parse_bool(col_def.get("Is Nullable", "true"), True)
+    
+    if cname not in df_raw.columns or expected_type not in TYPE_MAPPING:
+        continue
+    
+    # ✅ CORRECTION 1 : Dédupliquer AVANT toute opération
+    df_raw = deduplicate_columns(df_raw)
+    
+    # Vérifier si cast correct
+    safe_cast = df_raw.withColumn(
+        f"{cname}_test",
+        F.expr(f"try_cast({cname} as {expected_type})")
+    )
+    
+    # ✅ CORRECTION 2 : Dédupliquer après ajout de colonne test
+    safe_cast = deduplicate_columns(safe_cast)
+    
+    invalid_rows = safe_cast.filter(
+        F.col(f"{cname}_test").isNull() & 
+        F.col(cname).isNotNull()
+    )
+    
+    invalid_count = invalid_rows.count()
+    
+    if invalid_count > 0:
+        print(f"   ⚠️ {invalid_count} erreurs type sur {cname}")
+        
+        if "line_id" not in invalid_rows.columns:
+            invalid_rows = invalid_rows.withColumn(
+                "line_id",
+                F.row_number().over(Window.orderBy(F.monotonically_increasing_id()))
+            )
+        
+        err = invalid_rows.limit(1000).select(
+            F.lit(source_table).alias("table_name"),
+            F.lit(filename_for_log).alias("filename"),
+            F.col("line_id"),
+            F.lit(cname).alias("column_name"),
+            F.concat(
+                F.lit(f"TYPE MISMATCH: Expected {expected_type}, found: '"),
+                F.col(cname).cast("string"),
+                F.lit("'")
+            ).alias("error_message"),
+            F.col(cname).cast("string").alias("raw_value"),
+            F.lit(1).alias("error_count")
+        )
+        
+        df_err_global = df_err_global.union(err)
+        
+        if cname not in column_errors:
+            column_errors[cname] = []
+        column_errors[cname].append(f"{invalid_count} type mismatches")
+    
+    # ✅ CORRECTION 3 : Remplacer proprement la colonne
+    # Supprimer l'ancienne colonne, puis renommer la nouvelle
+    if f"{cname}_test" in safe_cast.columns:
+        df_raw = safe_cast.drop(cname).withColumnRenamed(f"{cname}_test", cname)
+    else:
+        df_raw = safe_cast
+    
+    # ✅ CORRECTION 4 : Dédupliquer après remplacement
+    df_raw = deduplicate_columns(df_raw)
+    
+    # Nullabilité
+    if not is_nullable:
+        null_rows = df_raw.filter(F.col(cname).isNull())
+        null_count = null_rows.count()
+        
+        if null_count > 0:
+            print(f"   ⚠️ {null_count} valeurs nulles sur {cname}")
+            
+            if "line_id" not in null_rows.columns:
+                null_rows = null_rows.withColumn(
+                    "line_id",
+                    F.row_number().over(Window.orderBy(F.monotonically_increasing_id()))
+                )
+            
+            err = null_rows.limit(1000).select(
+                F.lit(source_table).alias("table_name"),
+                F.lit(filename_for_log).alias("filename"),
+                F.col("line_id"),
+                F.lit(cname).alias("column_name"),
+                F.lit(f"NULL_VALUE: Column '{cname}' does not allow null").alias("error_message"),
+                F.lit(None).cast("string").alias("raw_value"),
+                F.lit(1).alias("error_count")
+            )
+            
+            df_err_global = df_err_global.union(err)
+            
+            if cname not in column_errors:
+                column_errors[cname] = []
+            column_errors[cname].append(f"{null_count} null values")
+
+# ✅ CORRECTION 5 : Dédupliquer une dernière fois à la fin
+df_raw = deduplicate_columns(df_raw)
+
+if column_errors:
+    print("\n⚠️ Résumé erreurs par colonne :")
+    for col_name, errors_list in column_errors.items():
+        print(f"  - {col_name}: {', '.join(errors_list)}")
