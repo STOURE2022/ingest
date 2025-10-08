@@ -1,0 +1,304 @@
+Parfait ! Je vois deux problèmes :
+
+1. ❌ **Erreur Delta** : `[DELTA_FAILED_TO_MERGE_FIELDS] Failed to merge fields 'line_id' and 'line_id'`
+2. ⚠️ **Logs incomplets** : Les erreurs de type mismatch ne sont pas loguées avant les valeurs nulles
+
+## 🔧 **Solution 1 : Corriger l'erreur Delta (line_id dupliqué)**
+
+Le problème vient du fait que `line_id` existe déjà dans `df_err_quality` et on essaie de l'ajouter à nouveau.
+
+### **Remplacez la fonction `check_data_quality()` par cette version corrigée :**
+
+```python
+def check_data_quality(df: DataFrame, table_name: str, merge_keys: list,
+                       filename: str = None, column_defs: pd.DataFrame = None) -> DataFrame:
+    """Vérifie qualité (nulls, doublons)"""
+    
+    # Supprimer line_id s'il existe déjà
+    if "line_id" in df.columns:
+        df = df.drop("line_id")
+    
+    # Ajouter line_id proprement
+    df = df.withColumn("line_id", F.row_number().over(Window.orderBy(F.monotonically_increasing_id())))
+    
+    errors_df = spark.createDataFrame([], ERROR_SCHEMA)
+    
+    data_columns = [c for c in df.columns if c not in 
+                    ["line_id", "yyyy", "mm", "dd", "FILE_PROCESS_DATE", "FILE_NAME_RECEIVED"]]
+    
+    if not data_columns:
+        return errors_df
+    
+    all_null = all(df.filter(F.col(c).isNotNull()).count() == 0 for c in data_columns)
+    if all_null:
+        return spark.createDataFrame(
+            [(table_name, filename, None, "ALL_COLUMNS", "FILE_EMPTY", None, 1)],
+            ERROR_SCHEMA
+        )
+    
+    # Clés nulles
+    for key in merge_keys or []:
+        if key in df.columns:
+            null_key_count = df.filter(F.col(key).isNull()).count()
+            if null_key_count > 0:
+                errs = spark.createDataFrame(
+                    [(table_name, filename, None, key, "NULL_KEY", None, null_key_count)],
+                    ERROR_SCHEMA
+                )
+                errors_df = errors_df.union(errs)
+    
+    # Doublons
+    if merge_keys:
+        valid_keys = [k for k in merge_keys if k in df.columns]
+        if valid_keys:
+            dup_df = (
+                df.groupBy(*valid_keys).count().filter(F.col("count") > 1)
+                  .select(
+                      F.lit(table_name).alias("table_name"),
+                      F.lit(filename).alias("filename"),
+                      F.lit(None).cast("int").alias("line_id"),
+                      F.lit(','.join(valid_keys)).alias("column_name"),
+                      F.lit("DUPLICATE_KEY").alias("error_message"),
+                      F.lit(None).cast("string").alias("raw_value"),
+                      F.col("count").alias("error_count")
+                  )
+            )
+            errors_df = errors_df.union(dup_df)
+    
+    # Nullabilité
+    if column_defs is not None:
+        subset = column_defs[column_defs["Delta Table Name"] == table_name]
+        total_rows = df.count()
+        
+        for idx, crow in subset.iterrows():
+            cname = crow["Column Name"]
+            is_nullable = parse_bool(crow.get("Is Nullable", "true"), True)
+            
+            if cname not in df.columns:
+                continue
+            
+            non_null_count = df.filter(F.col(cname).isNotNull()).count()
+            
+            if non_null_count == 0 and not is_nullable:
+                errs = spark.createDataFrame(
+                    [(table_name, filename, None, cname, "COLUMN_ALL_NULL", None, total_rows)],
+                    ERROR_SCHEMA
+                )
+                errors_df = errors_df.union(errs)
+            
+            elif non_null_count > 0 and not is_nullable:
+                null_count = df.filter(F.col(cname).isNull()).count()
+                if null_count > 0:
+                    null_sample = (
+                        df.filter(F.col(cname).isNull())
+                          .select(
+                              F.lit(table_name).alias("table_name"),
+                              F.lit(filename).alias("filename"),
+                              F.col("line_id"),
+                              F.lit(cname).alias("column_name"),
+                              F.lit("NULL_VALUE").alias("error_message"),
+                              F.lit(None).cast("string").alias("raw_value"),
+                              F.lit(1).alias("error_count")
+                          )
+                          .limit(1000)
+                    )
+                    errors_df = errors_df.union(null_sample)
+    
+    return errors_df
+```
+
+## 🎯 **Solution 2 : Logger les erreurs de type AVANT les valeurs nulles**
+
+Le problème est que les erreurs de type sont loguées pendant le typage des colonnes, AVANT la validation qualité globale. Pour les voir en premier, il faut réorganiser l'affichage.
+
+### **Remplacez la section "Aperçu erreurs" par ce code amélioré :**
+
+```python
+# =====================================================================
+# APERÇU DES ERREURS AMÉLIORÉ
+# =====================================================================
+
+print("\n📊 Aperçu erreurs détectées :")
+
+if df_err_global is not None and not df_err_global.rdd.isEmpty():
+    try:
+        error_count = df_err_global.count()
+        print(f"✅ {error_count} erreur(s) détectée(s)")
+        
+        # Séparer les erreurs par type
+        type_errors = df_err_global.filter(
+            F.col("error_message").contains("TYPE MISMATCH") |
+            F.col("error_message").contains("INVALID_DATE") |
+            F.col("error_message").contains("REJECT") |
+            F.col("error_message").contains("ICT_DRIVEN")
+        )
+        
+        null_errors = df_err_global.filter(
+            F.col("error_message").contains("NULL_VALUE") |
+            F.col("error_message").contains("NULL_KEY") |
+            F.col("error_message").contains("COLUMN_ALL_NULL")
+        )
+        
+        other_errors = df_err_global.filter(
+            ~(F.col("error_message").contains("TYPE MISMATCH") |
+              F.col("error_message").contains("INVALID_DATE") |
+              F.col("error_message").contains("REJECT") |
+              F.col("error_message").contains("ICT_DRIVEN") |
+              F.col("error_message").contains("NULL_VALUE") |
+              F.col("error_message").contains("NULL_KEY") |
+              F.col("error_message").contains("COLUMN_ALL_NULL"))
+        )
+        
+        # Affichage par ordre de priorité
+        if not type_errors.rdd.isEmpty():
+            print("\n🔴 ERREURS DE TYPAGE (TYPE MISMATCH) :")
+            type_summary = (
+                type_errors
+                .groupBy("column_name", "error_message")
+                .agg(F.sum("error_count").alias("total_count"))
+                .orderBy(F.desc("total_count"))
+            )
+            type_summary.show(50, truncate=False)
+            
+            # Afficher quelques exemples avec valeurs
+            print("\n📋 Exemples de valeurs invalides :")
+            type_errors.filter(F.col("raw_value").isNotNull()).select(
+                "column_name", "raw_value", "error_message"
+            ).distinct().show(20, truncate=False)
+        
+        if not null_errors.rdd.isEmpty():
+            print("\n⚪ ERREURS DE VALEURS NULLES :")
+            null_summary = (
+                null_errors
+                .groupBy("column_name", "error_message")
+                .agg(F.sum("error_count").alias("total_count"))
+                .orderBy(F.desc("total_count"))
+            )
+            null_summary.show(50, truncate=False)
+        
+        if not other_errors.rdd.isEmpty():
+            print("\n⚠️ AUTRES ERREURS :")
+            other_summary = (
+                other_errors
+                .groupBy("column_name", "error_message")
+                .agg(F.sum("error_count").alias("total_count"))
+                .orderBy(F.desc("total_count"))
+            )
+            other_summary.show(50, truncate=False)
+        
+    except Exception as e:
+        print(f"⚠️ Erreur affichage : {e}")
+        print(f"Colonnes : {df_err_global.columns}")
+else:
+    print("✅ Aucune erreur détectée")
+```
+
+## 🚀 **Solution 3 : Améliorer le résumé console avec priorité**
+
+Pour avoir un résumé encore plus clair dans la console, ajoutez aussi cette amélioration à la fonction `print_summary()` :
+
+```python
+def print_summary(table_name: str, filename: str, total_rows: tuple, corrupt_rows: int,
+                  anomalies_total: int, cleaned_rows: int, errors_df: DataFrame):
+    """Affiche résumé qualité avec priorité erreurs type"""
+    print("\n" + "=" * 80)
+    print(f"📊 Rapport | Table={table_name}, File={filename}")
+    
+    if isinstance(total_rows, tuple):
+        print(f"Lignes: {total_rows[0]} → {total_rows[1]}, rejetées: {corrupt_rows}, "
+              f"anomalies: {anomalies_total}, nettoyées: {cleaned_rows}")
+    else:
+        print(f"Lignes: {total_rows}, rejetées: {corrupt_rows}, "
+              f"anomalies: {anomalies_total}, nettoyées: {cleaned_rows}")
+    
+    print("=" * 80)
+    
+    if errors_df is not None and not errors_df.rdd.isEmpty():
+        print("⚠️ Problèmes de qualité détectés")
+        
+        # Séparer les types d'erreurs
+        type_errors = errors_df.filter(
+            F.col("error_message").contains("TYPE MISMATCH") |
+            F.col("error_message").contains("INVALID_DATE") |
+            F.col("error_message").contains("ICT_DRIVEN")
+        )
+        
+        null_errors = errors_df.filter(
+            F.col("error_message").contains("NULL_VALUE") |
+            F.col("error_message").contains("NULL_KEY")
+        )
+        
+        # 1. Afficher d'abord les erreurs de TYPE
+        if not type_errors.rdd.isEmpty():
+            type_summary = (
+                type_errors
+                .groupBy("error_message")
+                .agg(F.sum("error_count").alias("total_count"))
+                .orderBy(F.desc("total_count"))
+                .limit(50)
+                .collect()
+            )
+            
+            print("\n🔴 Erreurs de typage/format :")
+            for row in type_summary:
+                em = row["error_message"]
+                ec = row["total_count"]
+                print(f"  - {em}: {ec} erreurs")
+        
+        # 2. Ensuite les valeurs nulles
+        if not null_errors.rdd.isEmpty():
+            null_summary = (
+                null_errors
+                .groupBy("error_message")
+                .agg(F.sum("error_count").alias("total_count"))
+                .orderBy(F.desc("total_count"))
+                .limit(50)
+                .collect()
+            )
+            
+            print("\n⚪ Valeurs nulles :")
+            for row in null_summary:
+                em = row["error_message"]
+                ec = row["total_count"]
+                print(f"  - {em}: {ec} cas")
+    else:
+        print("\n✅ Aucun problème de qualité")
+    
+    print("=" * 80 + "\n")
+```
+
+## ✅ **Résultat attendu après correction**
+
+Avec ces modifications, vous verrez dans vos logs :
+
+```
+📊 Aperçu erreurs détectées :
+✅ X erreur(s) détectée(s)
+
+🔴 ERREURS DE TYPAGE (TYPE MISMATCH) :
++-----------+------------------------------------------------+------------+
+|column_name|error_message                                   |total_count |
++-----------+------------------------------------------------+------------+
+|contractid |TYPE MISMATCH: Expected INT, found: 'ABC123'    |150         |
+|siteid     |TYPE MISMATCH: Expected INT, found: 'SITE_X'    |75          |
++-----------+------------------------------------------------+------------+
+
+📋 Exemples de valeurs invalides :
++-----------+---------+------------------------------------------------+
+|column_name|raw_value|error_message                                   |
++-----------+---------+------------------------------------------------+
+|contractid |ABC123   |TYPE MISMATCH: Expected INT, found: 'ABC123'    |
+|contractid |XYZ456   |TYPE MISMATCH: Expected INT, found: 'XYZ456'    |
+|siteid     |SITE_X   |TYPE MISMATCH: Expected INT, found: 'SITE_X'    |
++-----------+---------+------------------------------------------------+
+
+⚪ ERREURS DE VALEURS NULLES :
++-----------+------------------------------------------------+------------+
+|column_name|error_message                                   |total_count |
++-----------+------------------------------------------------+------------+
+|contractid |NULL_VALUE: Column 'contractid' does not allow..|3           |
+|siteid     |NULL_VALUE: Column 'siteid' does not allow...   |2           |
++-----------+------------------------------------------------+------------+
+```
+
+Appliquez ces trois corrections et relancez votre notebook. Les erreurs de type apparaîtront maintenant **avant** les valeurs nulles, et l'erreur Delta sur `line_id` sera résolue ! 🎉
