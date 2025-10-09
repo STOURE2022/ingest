@@ -1,0 +1,7 @@
+WAX_ZIP_PATH=C:\Users\Z277MQ\.databricks\wax_ingestion_main\data\input\wax_delta_from_historized.zip
+WAX_EXCEL_PATH=C:\Users\Z277MQ\.databricks\wax_ingestion_main\data\config\custom_test2_secret_conf.xlsx
+WAX_EXTRACT_DIR=C:\Users\Z277MQ\.databricks\wax_ingestion_main\data\extracted
+WAX_LOG_EXEC_PATH=C:\Users\Z277MQ\.databricks\wax_ingestion_main\data\logs\execution
+WAX_LOG_QUALITY_PATH=C:\Users\Z277MQ\.databricks\wax_ingestion_main\data\logs\quality
+WAX_ENV=dev
+WAX_VERSION=v1
