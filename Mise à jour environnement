@@ -1,0 +1,52 @@
+def get_spark(self):
+        """Obtient la session Spark"""
+        from pyspark.sql import SparkSession
+        
+        if self.is_databricks:
+            return SparkSession.builder.getOrCreate()
+        else:
+            # Configuration locale avec Delta Lake
+            try:
+                # Importer Delta et configurer AVANT la création
+                from delta import configure_spark_with_delta_pip
+                
+                # Créer le builder
+                builder = (SparkSession.builder
+                          .appName("WAX-Local")
+                          .master("local[*]")
+                          .config("spark.driver.memory", "4g")
+                          .config("spark.executor.memory", "4g")
+                          .config("spark.sql.warehouse.dir", "./spark-warehouse"))
+                
+                # Configurer Delta Lake sur le BUILDER (pas sur la session)
+                spark = configure_spark_with_delta_pip(builder).getOrCreate()
+                
+                print("✅ Delta Lake configuré avec succès")
+                return spark
+                
+            except ImportError as e:
+                print(f"❌ Delta Lake non installé : {e}")
+                print("   Installer avec : pip install delta-spark==3.0.0")
+                
+                # Fallback sans Delta
+                spark = (SparkSession.builder
+                        .appName("WAX-Local")
+                        .master("local[*]")
+                        .config("spark.driver.memory", "4g")
+                        .getOrCreate())
+                
+                print("⚠️ Spark démarré SANS Delta Lake")
+                return spark
+            
+            except Exception as e:
+                print(f"⚠️ Erreur configuration Delta : {e}")
+                
+                # Fallback sans Delta
+                spark = (SparkSession.builder
+                        .appName("WAX-Local")
+                        .master("local[*]")
+                        .config("spark.driver.memory", "4g")
+                        .getOrCreate())
+                
+                print("⚠️ Spark démarré SANS Delta Lake")
+                return spark
