@@ -1,117 +1,167 @@
-"""
-delta_manager.py
-----------------
-Gestion des écritures Delta/Parquet du pipeline WAX :
-- Sauvegarde append / overwrite
-- Merge Delta (upsert)
-- Enregistrement Hive / Unity Catalog
-Compatible Databricks et exécution locale.
-"""
+# src/delta_manager.py
+# --------------------------------------------------------------------------------------
+# Gestion des écritures Delta/Parquet :
+#  - Sauvegarde append / overwrite / merge
+#  - Enregistrement dans Unity Catalog (Databricks) ou Hive local
+#  - Détection automatique de l'environnement
+# --------------------------------------------------------------------------------------
 
 import os
-from pyspark.sql import DataFrame, SparkSession
+from datetime import datetime
+from pyspark.sql import SparkSession, DataFrame, functions as F
 from delta.tables import DeltaTable
 
-
-# ==============================================================
-# 1️⃣ Détection d'environnement
-# ==============================================================
-
-def is_databricks() -> bool:
-    """Détermine si on exécute sur Databricks."""
-    return "DATABRICKS_RUNTIME_VERSION" in os.environ
+from environment import is_databricks, ensure_dir, get_default_catalog_schema, fq_table_name
 
 
-# ==============================================================
-# 2️⃣ Sauvegarde Delta ou Parquet
-# ==============================================================
+# ======================================================================================
+# 1️⃣ - CONSTRUCTION DES CHEMINS DE SORTIE
+# ======================================================================================
+def build_output_path(env: str, zone: str, table_name: str, version: str, wax_base: str = None) -> str:
+    """
+    Construit le chemin Delta pour une table donnée.
+    """
+    if wax_base:
+        base = wax_base
+    elif is_databricks():
+        base = f"/mnt/wax/{env}/{zone}/{version}"
+    else:
+        base = os.path.abspath(f"./data/wax/{env}/{zone}/{version}")
 
+    path = os.path.join(base, table_name)
+    return path
+
+
+# ======================================================================================
+# 2️⃣ - SAUVEGARDE DELTA / PARQUET
+# ======================================================================================
 def save_delta_table(
     spark: SparkSession,
     df: DataFrame,
-    params: dict,
-    table_name: str,
+    path: str,
     mode: str = "append",
-    partition_cols: list = None,
+    add_ts: bool = False,
+    file_name_received: str = None,
+    parts: dict | None = None
 ):
     """
-    Écrit un DataFrame dans Delta Lake ou Parquet (local).
+    Sauvegarde un DataFrame en Delta (Databricks) ou Parquet (local).
+    - `parts` : dictionnaire contenant éventuellement {'yyyy','mm','dd'}
+    - `add_ts` : ajoute FILE_PROCESS_DATE et FILE_NAME_RECEIVED
     """
-    base_path = params.get("base_output_path") or params.get("log_exec_path", "./data/output")
-    output_path = os.path.join(base_path, table_name)
 
-    if df is None or df.rdd.isEmpty():
-        print(f"⚠️ Aucun enregistrement à sauvegarder pour {table_name}.")
-        return
+    today = datetime.today()
+    y = int((parts or {}).get("yyyy", today.year))
+    m = int((parts or {}).get("mm", today.month))
+    d = int((parts or {}).get("dd", today.day))
 
-    print(f"💾 Sauvegarde [{table_name}] → {output_path} | mode={mode}")
+    if add_ts:
+        df = df.withColumn("FILE_PROCESS_DATE", F.current_timestamp())
 
-    writer = df.write.mode(mode).option("mergeSchema", "true")
-    if partition_cols:
-        writer = writer.partitionBy(*partition_cols)
+    if file_name_received:
+        base_name = os.path.splitext(os.path.basename(file_name_received))[0]
+        df = df.withColumn("FILE_NAME_RECEIVED", F.lit(base_name))
+
+    # Partitionnement temporel
+    df = (
+        df.withColumn("yyyy", F.lit(y).cast("int"))
+          .withColumn("mm", F.lit(m).cast("int"))
+          .withColumn("dd", F.lit(d).cast("int"))
+    )
+
+    if not is_databricks():
+        ensure_dir(path)
+
+    print(f"💾 Sauvegarde Delta → {path} | mode={mode}")
 
     if is_databricks():
-        writer.format("delta").save(output_path)
-        print(f"✅ Table Delta sauvegardée sur Databricks : {output_path}")
+        df.write.format("delta").mode(mode).option("mergeSchema", "true") \
+            .partitionBy("yyyy", "mm", "dd").save(path)
     else:
-        writer.format("parquet").save(output_path)
-        print(f"✅ Table Parquet sauvegardée localement : {output_path}")
+        df.write.mode(mode).parquet(path)
+
+    print(f"✅ Table sauvegardée : {path}")
 
 
-# ==============================================================
-# 3️⃣ Merge Delta
-# ==============================================================
-
-def merge_delta_table(spark, df_source, target_path, merge_keys):
+# ======================================================================================
+# 3️⃣ - ENREGISTREMENT METASTORE / UNITY CATALOG
+# ======================================================================================
+def register_table_in_metastore(
+    spark: SparkSession,
+    table_name: str,
+    path: str,
+    if_exists: str = "ignore"
+):
     """
-    Effectue un merge Delta (upsert) sur la table existante.
+    Enregistre la table dans Unity Catalog (Databricks) ou dans Hive local.
+    """
+    ns = get_default_catalog_schema()
+    catalog, schema = ns["catalog"], ns["schema"]
+    full_name = fq_table_name(table_name, catalog, schema)
+
+    # Vérification existence
+    try:
+        existing = [t.name for t in spark.catalog.listTables(schema)]
+        if table_name in existing and if_exists == "ignore":
+            print(f"⚠️ Table déjà existante : {full_name}")
+            return
+        if table_name in existing and if_exists == "overwrite":
+            print(f"♻️ Suppression de la table existante : {full_name}")
+            spark.sql(f"DROP TABLE IF EXISTS {full_name}")
+    except Exception:
+        pass
+
+    # Création table
+    try:
+        spark.sql(f"""
+            CREATE TABLE IF NOT EXISTS {full_name}
+            USING DELTA
+            LOCATION '{path}'
+        """)
+        print(f"✅ Table enregistrée dans le metastore : {full_name}")
+    except Exception as e:
+        print(f"⚠️ Erreur création table {full_name} : {e}")
+
+
+# ======================================================================================
+# 4️⃣ - MERGE DELTA TABLE
+# ======================================================================================
+def merge_delta_table(
+    spark: SparkSession,
+    df_updates: DataFrame,
+    path: str,
+    merge_keys: list[str],
+    compare_col: str = "FILE_PROCESS_DATE"
+):
+    """
+    Effectue un MERGE Delta (upsert) entre le DataFrame et la table existante.
     """
     if not is_databricks():
-        print("ℹ️ Merge ignoré (mode local sans Delta).")
+        print("⚠️ Merge Delta disponible uniquement sur Databricks (DeltaTable).")
+        save_delta_table(spark, df_updates, path, mode="append")
         return
 
-    if not DeltaTable.isDeltaTable(spark, target_path):
-        print(f"⚙️ Table Delta inexistante → création initiale : {target_path}")
-        df_source.write.format("delta").mode("overwrite").save(target_path)
+    if not DeltaTable.isDeltaTable(spark, path):
+        print("⚠️ Table cible non Delta — création initiale.")
+        save_delta_table(spark, df_updates, path, mode="overwrite")
         return
 
-    delta_target = DeltaTable.forPath(spark, target_path)
-    condition = " AND ".join([f"t.{k}=s.{k}" for k in merge_keys])
+    target = DeltaTable.forPath(spark, path)
 
-    (
-        delta_target.alias("t")
-        .merge(df_source.alias("s"), condition)
-        .whenMatchedUpdateAll()
-        .whenNotMatchedInsertAll()
+    # Colonnes de mise à jour
+    update_cols = [c for c in df_updates.columns if c not in merge_keys]
+    update_expr = {c: f"updates.{c}" for c in update_cols}
+
+    cond = " AND ".join([f"target.{k}=updates.{k}" for k in merge_keys])
+
+    (target.alias("target")
+        .merge(df_updates.alias("updates"), cond)
+        .whenMatchedUpdate(
+            condition=f"updates.{compare_col} > target.{compare_col}",
+            set=update_expr
+        )
+        .whenNotMatchedInsert(values=update_expr)
         .execute()
     )
 
-    print(f"✅ MERGE terminé sur {merge_keys} → {target_path}")
-
-
-# ==============================================================
-# 4️⃣ Enregistrement dans le métastore Hive / Unity Catalog
-# ==============================================================
-
-def register_table_in_metastore(spark, df, params, table_name, if_exists="ignore"):
-    """
-    Enregistre la table dans Hive ou Unity Catalog (Databricks uniquement).
-    """
-    if not is_databricks():
-        print(f"ℹ️ Enregistrement Hive ignoré (mode local). Table: {table_name}")
-        return
-
-    env = params.get("env", "dev")
-    catalog = params.get("catalog", f"{env}_wax_catalog")
-    database = params.get("database", f"{env}_wax_db")
-    full_name = f"{catalog}.{database}.{table_name}"
-
-    print(f"🧩 Enregistrement Unity Catalog → {full_name}")
-
-    try:
-        if if_exists == "overwrite":
-            spark.sql(f"DROP TABLE IF EXISTS {full_name}")
-        df.write.format("delta").mode("overwrite").saveAsTable(full_name)
-        print(f"✅ Table {full_name} enregistrée avec succès dans Unity Catalog.")
-    except Exception as e:
-        print(f"⚠️ Erreur d’enregistrement Hive/Unity Catalog : {e}")
+    print(f"✅ MERGE terminé sur {path} (keys={merge_keys})")

@@ -1,52 +1,80 @@
-"""
-config.py
-----------
-Gestion centralisée des paramètres du pipeline WAX :
-- Lecture depuis Databricks widgets si disponibles
-- Fallback sur des valeurs locales par défaut
-"""
+# src/config.py
+# --------------------------------------------------------------------------------------
+# Chargement de la configuration (Databricks)
+# via les widgets dbutils.widgets.
+# Compatible avec le schéma utilisé dans ton notebook WAX.
+# --------------------------------------------------------------------------------------
 
-import os
+from typing import Dict
 
 
-def get_config(dbutils=None):
+def load_config_from_widgets(dbutils) -> Dict[str, str]:
     """
-    Récupère la configuration d'exécution :
-    - si `dbutils` est fourni → lecture depuis les widgets Databricks
-    - sinon → valeurs locales (mode test/CI/CD)
-
-    Returns:
-        dict: dictionnaire des paramètres du pipeline
+    Charge la configuration depuis les widgets Databricks.
+    Chaque widget doit être créé dans le notebook avant l'appel :
+      dbutils.widgets.text("zip_path", "dbfs:/FileStore/tables/wax_delta_from_historized.zip")
+      dbutils.widgets.text("excel_path", "dbfs:/FileStore/tables/custom_test2_secret_conf.xlsx")
+      ...
     """
-    print("⚙️ Chargement de la configuration...")
+    print("⚙️ Chargement de la configuration depuis les widgets Databricks...")
 
-    # Lecture Databricks (prioritaire)
-    if dbutils:
-        print("📦 Mode Databricks détecté (widgets actifs).")
-        params = {
-            "env": dbutils.widgets.get("env") if dbutils.widgets.exists("env") else "dev",
-            "version": dbutils.widgets.get("version") if dbutils.widgets.exists("version") else "v1",
-            "zip_path": dbutils.widgets.get("zip_path"),
-            "excel_path": dbutils.widgets.get("excel_path"),
-            "extract_dir": dbutils.widgets.get("extract_dir"),
-            "log_exec_path": dbutils.widgets.get("log_exec_path"),
-            "log_quality_path": dbutils.widgets.get("log_quality_path"),
-        }
-        return params
+    keys = [
+        "zip_path",
+        "excel_path",
+        "extract_dir",
+        "log_exec_path",
+        "log_quality_path",
+        "env",
+        "version"
+    ]
 
-    # Fallback local
-    print("💻 Mode local détecté (aucun widget trouvé).")
-    base_dir = os.getcwd()
+    params = {}
+    for key in keys:
+        try:
+            params[key] = dbutils.widgets.get(key)
+        except Exception:
+            params[key] = None
 
-    params = {
+    print("✅ Paramètres chargés :")
+    for k, v in params.items():
+        print(f"   • {k}: {v}")
+
+    # Valeurs par défaut (fallbacks)
+    params.setdefault("env", "dev")
+    params.setdefault("version", "v1")
+
+    return params
+
+
+def create_default_widgets(dbutils) -> None:
+    """
+    Crée les widgets Databricks s’ils n’existent pas.
+    À appeler au début du notebook si besoin.
+    """
+    defaults = {
+        "zip_path": "dbfs:/FileStore/tables/wax_delta_from_historized.zip",
+        "excel_path": "dbfs:/FileStore/tables/custom_test2_secret_conf.xlsx",
+        "extract_dir": "dbfs:/tmp/unzipped_wax_csvs",
+        "log_exec_path": "/mnt/logs/wax_execution_logs_delta",
+        "log_quality_path": "/mnt/logs/wax_data_quality_errors_delta",
         "env": "dev",
-        "version": "v1",
-        "zip_path": os.path.join(base_dir, "data/wax_delta_from_historized.zip"),
-        "excel_path": os.path.join(base_dir, "data/custom_test2_secret_conf.xlsx"),
-        "extract_dir": os.path.join(base_dir, "tmp/unzipped_wax_csvs"),
-        "log_exec_path": os.path.join(base_dir, "logs/wax_execution_logs_delta"),
-        "log_quality_path": os.path.join(base_dir, "logs/wax_quality_logs_delta"),
+        "version": "v1"
     }
 
-    print("✅ Configuration locale chargée avec succès.")
-    return params
+    for key, default in defaults.items():
+        try:
+            dbutils.widgets.get(key)
+        except Exception:
+            dbutils.widgets.text(key, default, key.capitalize().replace("_", " "))
+
+    print("✅ Widgets créés ou déjà existants.")
+
+
+def get_param(dbutils, key: str, default=None):
+    """
+    Récupère un paramètre depuis les widgets avec valeur par défaut.
+    """
+    try:
+        return dbutils.widgets.get(key)
+    except Exception:
+        return default
